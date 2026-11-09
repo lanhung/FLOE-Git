@@ -31,6 +31,8 @@ paper/           论文 LaTeX 与插图
 | `configs/FLOE/res80_noglcm.py`、`res160_noglcm.py` | 分辨率实验：输入 80 m vs 160 m，标签与评估均在 80 m |
 | `configs/FLOE/sota_deeplabv3_in1k_dlr.py` | DeepLabV3+ R50 对比 |
 | `configs/AI4Arctic/a4a_baseline.py`、`a4a_pgsg.py` | AutoICE（AI4Arctic ready-to-train v3），仅 SAR |
+| `configs/Pooled/pooled_noglcm.py` | 本档案 fold-K 训练景 + 全部 AutoICE 训练景（对照为 `res80_noglcm`） |
+| `configs/FLOE/comp.py`、`comp_noord.py`、`comp_allce.py` | 冰图组成监督（`floe/composition.py`）及其消融 |
 
 论文实验一律逐折训练：`python -m tools.train <cfg> --fold K`，名单取 `datalists/cv5/fold{K}_{train,val}.json`。
 配置里默认的 `train_417`/`val_417` 名单只用于冒烟：42 个验证景中有 14 个与训练景属于同一 datatake 的相邻帧。
@@ -60,10 +62,11 @@ python -m tools.analysis.paired_cv --a "$FLOE_CM_DIR/cv5/baseline_s42_f{K}.npz" 
 | `tools/data/check_transfer.py` | 检查传输完整性，可逐个打开 NC |
 | `tools/data/fetch_ai4arctic.sh`、`convert_ai4arctic.py`、`prepare_ai4arctic.sh` | 下载 AutoICE 并按官方 MD5 核对，统一到本档案的辐射标准化，建名单与 tile 索引 |
 | `tools/data/folds_from_cm.py` | 由旧五折逐景 CM 恢复折名单 |
+| `tools/data/pool_archives.py` | 两个档案合并训练：符号链接目录 + 合并 tile 索引 |
 
 ## 文档
 
-- `docs/PAPER_TODO.md`：当前计划与进度。
+- `docs/PAPER_TODO.md`：当前计划与进度（§6 为组成监督方法与实验设计）。
 - `docs/PAPER_NUMBERS.md`：论文中每个数字的来源。
 - `docs/DATASET_HANDBOOK.md`、`docs/dataset_distribution.md`、`docs/tile_sampling.md`：数据格式、分布与采样设计。
 - `docs/EXPERIMENT_RESULTS.md`：历史 fold-0 结果及其适用范围。

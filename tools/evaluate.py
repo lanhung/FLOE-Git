@@ -18,6 +18,7 @@ import os.path as osp
 import pathlib
 import warnings
 
+import h5py
 import numpy as np
 import torch
 from mmcv import Config, mkdir_or_exist
@@ -69,7 +70,29 @@ def parse_args():
                         help='把每个场景的混淆矩阵存成 .npz（scenes:(S,) str, cm:(S,C,C) float64，'
                              '按 target_chart）。全局 CM = cm.sum(0)，与本脚本打印的全局指标同源。'
                              '供 tools.analysis.scene_cm / paired_cv 使用。')
+    parser.add_argument('--composition-dir', type=pathlib.Path, default=None,
+                        help='chart sidecars (<scene>.chart.h5, tools.data.build_composition): '
+                             'also score predicted class fractions per ice-chart polygon')
+    parser.add_argument('--dump-polygons', type=pathlib.Path, default=None,
+                        help='with --composition-dir: save per-polygon predicted histograms and '
+                             'chart compositions (.npz) for tools.analysis.composition_eval')
     return parser.parse_args()
+
+
+def scene_polygons(chart_dir, scene_id, pred, invalid):
+    """Per-polygon predicted class histogram of one scene, with the chart composition."""
+    from floe.composition import polygon_histograms
+    path = osp.join(str(chart_dir), scene_id + '.chart.h5')
+    if not osp.exists(path):
+        print(f'[Composition] no chart sidecar for {scene_id}, skipped')
+        return None
+    with h5py.File(path, 'r') as h:
+        poly = h['polygon_id'][...]
+        Q, U = h['composition'][...], h['unknown'][...]
+    pred = np.asarray(pred.cpu()).astype(np.int64).reshape(poly.shape)
+    valid = ~np.asarray(invalid.cpu()).astype(bool).reshape(poly.shape)
+    ids, hist = polygon_histograms(pred, poly, valid=valid)
+    return ids, hist, Q[ids], U[ids]
 
 
 def load_checkpoint(net, checkpoint_path, device):
@@ -451,6 +474,7 @@ def main():
         print(f'Results will be saved to: {output_dir}')
 
     per_scene_results = {}
+    polygon_rows = {}          # scene_id -> (ids, hist, q, u)，仅 --composition-dir 时填充
     per_scene_cm = {}          # chart -> {scene_id: (C, C) ndarray}，仅 --dump-cm 时填充
     global_cm = {
         chart: torch.zeros((train_options['n_classes'][chart], train_options['n_classes'][chart]),
@@ -555,6 +579,11 @@ def main():
                 global_cm[chart] += scene_cm
                 if args.dump_cm is not None:
                     per_scene_cm.setdefault(chart, {})[scene_id] = scene_cm.cpu().numpy()
+            if args.composition_dir is not None:
+                _tc = train_options.get('target_chart', train_options['charts'][0])
+                _rows = scene_polygons(args.composition_dir, scene_id, output_class[_tc], tfv_mask)
+                if _rows is not None:
+                    polygon_rows[scene_id] = _rows
 
     print('\nComputing global metrics...')
     global_result = derive_metrics_from_cm(global_cm, train_options)
@@ -619,6 +648,24 @@ def main():
               f'({len(scenes)} scenes, {cm_stack.shape[1]}x{cm_stack.shape[2]})')
         print(f'  self-check: mIoU from summed per-scene CM = {iou.mean().item():.6f}  '
               f'(global above = {global_result["miou"][target_chart]:.6f})')
+
+    if polygon_rows:
+        from floe.composition import composition_metrics
+        scenes = sorted(polygon_rows)
+        cat = lambda j: np.concatenate([polygon_rows[sc][j] for sc in scenes])
+        hist, q, u = cat(1), cat(2), cat(3)
+        m = composition_metrics(hist, q, u)
+        print(f'\n[Composition] {len(scenes)} scenes with chart sidecars')
+        print('[Composition] ' + '  '.join(
+            f'{k}={v:.4f}' if isinstance(v, float) else f'{k}={v}' for k, v in m.items()))
+        if args.dump_polygons is not None:
+            mkdir_or_exist(osp.dirname(str(args.dump_polygons)) or '.')
+            np.savez_compressed(
+                str(args.dump_polygons),
+                scene=np.concatenate([[sc] * len(polygon_rows[sc][0]) for sc in scenes]).astype(str),
+                polygon=cat(0), hist=hist, q=q, u=u,
+                checkpoint=np.array(str(args.checkpoint[0])))
+            print(f'Dumped {len(hist)} polygons -> {args.dump_polygons}')
 
     if output_dir:
         def _to_native(obj):
