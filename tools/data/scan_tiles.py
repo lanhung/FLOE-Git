@@ -1,30 +1,25 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-扫描所有 .nc 场景，建立 chunk 对齐的 tile 索引表，供训练时做加权采样。
+扫描所有 .nc 场景，建立与 HDF5 chunk（512x512）对齐的 tile 索引，供训练时按类别加权采样。
 
-背景（2026-07-09）：.nc 底层 HDF5 的二维变量是 chunks=(512,512)+gzip4 存储的，
-可以只解压覆盖到的 chunk。实测读一个 chunk 对齐的 512x512 tile（8 个变量）约 27ms，
-而当前 loaders.py 走的 `xarray.to_array()` 整景解码约 9.2s / 景（输出 2.8~3.1GB
-float32）。同时全图约 67% 的 512 tile 是"全无效"（黑边 + 陆地，标签 255，在 loss 里
-被 ignore_index 屏蔽，梯度贡献恒为 0），解码它们纯属浪费。
-
-本脚本只读每景的 FLOE + global_valid_mask 两个 uint8 通道（约 0.29s / 景），按 512
-对齐网格枚举 tile，剔除全无效 tile，为剩下的 tile 记录有效像元比例和类别直方图。
-训练时据此直接加权采样 tile，把原来的"随机裁 + 概率拒绝 + 重试"换成零拒绝的索引采样。
+只读每景的 FLOE + global_valid_mask，剔除没有任何有效标签的 tile（全图约 67%），为其余
+tile 记录有效比例与类别直方图。读一个对齐 tile 约 27ms，整景解码约 9s，所以训练只解码
+采到的 tile。换数据目录或 patch_size 后必须重扫（loaders.py 启动时校验）。
 
 用法：
     python -m tools.data.scan_tiles --data-dir /root/autodl-tmp/FLOE_datanc \
-        --out /root/autodl-tmp/floe_tile_index.npz --workers 16
+        --out /root/autodl-tmp/floe_tile_index.npz --patch-size 256 --workers 16
 
-输出 .npz（几 MB）：
-    files             (S,)   str    场景文件名，与 scene_id 对应
+输出 .npz：
+    files             (S,)   str      场景文件名，与 scene_id 对应
     scene_id          (N,)   int16
-    row, col          (N,)   int32  tile 左上角在原景中的像素坐标（512 的整数倍）
+    row, col          (N,)   int32    tile 左上角在原景中的像素坐标（tile_size 的整数倍）
     valid_ratio       (N,)   float32  tile 内 global_valid_mask==1 的比例
-    label_valid_ratio (N,)   float32  tile 内 FLOE != 255 的比例
+    label_valid_ratio (N,)   float32  tile 内 FLOE 属于类别 0..5 的比例
     hist              (N, 6) int32    tile 内 FLOE 各类别（0..5）的像素数
-    tile_size         ()     int32
+    hist_w            (N, 6) float32  按裁剪覆盖核加权的 hist（见 crop_coverage_kernel）
+    tile_size, patch_size  () int32
 """
 import argparse
 import os
@@ -33,13 +28,15 @@ import time
 from multiprocessing import Pool
 
 import h5py
+try:
+    import hdf5plugin  # noqa: F401  registers Blosc/zstd filters (tools.data.recompress output)
+except ImportError:
+    hdf5plugin = None
 import numpy as np
 
-N_CLASSES = 6          # FLOE_LOOKUP: 0=水 1=饼状冰 2=小 3=中 4=大 5=巨
-IGNORE_VAL = 255
-# 数据集标签 6(冰山) 在 loader 里被重映射为 255；扫描时同样并入 ignore 统计，
-# 否则索引表里的类别直方图会和训练时实际看到的标签不一致。
-ICEBERG_VAL = 6
+# FLOE_LOOKUP: 0=水 1=饼状冰 2=小 3=中 4=大 5=巨。标签 6（冰山）在 loader 里被重映射为 255，
+# 所以扫描时 >=6 的标签一律按 ignore 统计，直方图才与训练实际看到的标签一致。
+N_CLASSES = 6
 
 
 def parse_args():
@@ -56,15 +53,11 @@ def parse_args():
 
 
 def crop_coverage_kernel(tile, patch):
-    """tile 内每个像素被"随机裁的 patch"覆盖到的次数（未归一化）。
+    """tile 内每个像素被随机裁剪的 patch 覆盖的次数（未归一化）。
 
-    训练时 patch 原点均匀取自 [0, tile-patch] 的整数格点，所以 tile 中心的像素比边缘的
-    像素更容易被采到（一维上是个梯形/三角核）。不把这个权重算进直方图的话，索引里的
-    类别占比描述的是"整个 tile"，而训练实际看到的是"按此核加权后的 tile"——两者在
-    空间分布不均匀的类别上会系统性错开（实测 big/vast 各被高估约 0.013）。
-
-    一维：位置 u 被覆盖的原点数 = min(u, tile-patch) - max(0, u-patch+1) + 1
-    二维取外积。
+    patch 原点均匀取自 [0, tile-patch]，中心像素比边缘更常被采到。直方图不按此核加权的话，
+    空间分布不均匀的类别占比会系统性偏差（实测 big/vast 各被高估约 0.013）。
+    一维：位置 u 被覆盖的原点数 = min(u, tile-patch) - max(0, u-patch+1) + 1，二维取外积。
     """
     u = np.arange(tile)
     k1 = np.minimum(u, tile - patch) - np.maximum(0, u - patch + 1) + 1
@@ -79,7 +72,7 @@ def scan_one(job):
         lab = f['FLOE'][:]
         vmask = f['global_valid_mask'][:]
 
-    # 全景像素直方图（把 >=6 的标签，含冰山 6 和 mask 255，一并算作 ignore）
+    # 全景像素直方图（>=6 的标签，含冰山 6 和 mask 255，都算作 ignore）
     flat = lab.ravel()
     px = np.bincount(flat, minlength=256).astype(np.int64)
     px_cls = px[:N_CLASSES].copy()
@@ -98,10 +91,8 @@ def scan_one(job):
             h = np.bincount(tflat, minlength=256)
             hc = h[:N_CLASSES]
             n_label_valid = int(hc.sum())
-            # 全无效 tile：没有任何一个可参与 loss 的像元。直接丢弃。
-            if n_label_valid == 0:
+            if n_label_valid == 0:   # 没有可参与 loss 的像元
                 continue
-            # 裁剪覆盖核加权的直方图：训练时实际期望看到的各类像素数（相对量）。
             hw = np.bincount(tflat, weights=kflat, minlength=256)[:N_CLASSES]
             rows.append(r)
             cols.append(c)
@@ -133,7 +124,7 @@ def main():
         files = files[:args.limit]
     print(f'Found {len(files)} .nc scenes in {args.data_dir}')
 
-    # 校验 tile_size 与 HDF5 chunk 对齐——不对齐的话读 tile 会跨 chunk，速度打折
+    # tile 不与 HDF5 chunk 对齐时读取会跨 chunk、变慢
     with h5py.File(osp.join(args.data_dir, files[0]), 'r') as f:
         ch = f['FLOE'].chunks
     if ch is None or ch[0] != args.tile_size or ch[1] != args.tile_size:
@@ -158,7 +149,7 @@ def main():
            for k in ('scene_id', 'row', 'col', 'valid_ratio', 'label_valid_ratio')}
     out['hist'] = np.concatenate([r['hist'] for r in results], axis=0)
     out['hist_w'] = np.concatenate([r['hist_w'] for r in results], axis=0)
-    # imap_unordered 打乱了顺序，按 (scene_id, row, col) 排回确定序，便于复现和调试
+    # imap_unordered 不保序：按 (scene_id, row, col) 排回确定顺序
     order = np.lexsort((out['col'], out['row'], out['scene_id']))
     for k in list(out):
         out[k] = out[k][order]
@@ -171,7 +162,7 @@ def main():
     np.savez_compressed(args.out, **out)
     sz = os.path.getsize(args.out) / 1e6
 
-    # ---------------- 统计报告 ----------------
+    # 统计报告
     px_cls = np.sum([r['px_cls'] for r in results], axis=0)
     px_ignore = sum(r['px_ignore'] for r in results)
     px_total = px_cls.sum() + px_ignore
@@ -180,7 +171,7 @@ def main():
 
     hist = out['hist']
     tile_valid = hist.sum(axis=1)
-    # 冰类含类 1（ice cake，2026-07-16 数据集扩充后不再为空），从 1 起切
+    # 冰类 = 类 1..5（含 ice cake）
     n_ice = int((hist[:, 1:].sum(axis=1) > 0).sum())
     n_water_only = n_kept - n_ice
 
