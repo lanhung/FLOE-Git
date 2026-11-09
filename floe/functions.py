@@ -1242,6 +1242,10 @@ def create_train_validation_and_test_scene_list(train_options):
     """
     with open(train_options['path_to_env'] + train_options['train_list_path']) as file:
         train_options['train_list'] = json.loads(file.read())
+    # Pooled training: scenes of other archives are appended to every fold's train list.
+    for extra in train_options.get('extra_train_lists', ()):
+        with open(train_options['path_to_env'] + extra) as file:
+            train_options['train_list'] += json.loads(file.read())
 
     if train_options['cross_val_run']:
         train_options['validate_list'] = list(np.random.choice(np.array(
