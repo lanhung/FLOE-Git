@@ -39,6 +39,7 @@ from floe.loaders import (get_variable_options, val_scoped_options, AI4ArcticCha
                      AI4ArcticChallengeTestDataset, preload_scene_cache, limit_torch_threads,
                      val_ondemand_ok)
 from floe.utils import colour_str
+from floe.composition import CompositionLoss
 
 
 def parse_args():
@@ -244,6 +245,23 @@ def train(cfg, train_options, net, device, dataloader_train, dataloader_val, opt
     loss_ce_functions = {chart: get_loss(train_options['chart_loss'][chart]['type'], chart=chart, **train_options['chart_loss'][chart]).to(device)
                          for chart in train_options['charts']}
 
+    # Chart-composition supervision (floe/composition.py): polygon-level proportion and
+    # ordinal losses on the target chart; hard_ce='pure' keeps pixel CE only inside
+    # polygons dominated by one class, 'all' keeps the ordinary CE, 'none' drops it.
+    comp_cfg = train_options.get('composition_supervision') or {}
+    comp_loss = None
+    if comp_cfg.get('enabled', False):
+        _ds = dataloader_train.dataset
+        comp_loss = CompositionLoss(
+            _ds.bag_Q, _ds.bag_U, pure_threshold=comp_cfg.get('pure_threshold', 0.9),
+            w_prop=comp_cfg.get('w_prop', 1.0), w_ord=comp_cfg.get('w_ord', 1.0),
+            min_pixels=comp_cfg.get('min_bag_pixels', 64)).to(device)
+        comp_weight = float(comp_cfg.get('weight', 1.0))
+        comp_hard = comp_cfg.get('hard_ce', 'pure')
+        assert comp_hard in ('pure', 'all', 'none'), comp_hard
+        print(f'[Composition] weight={comp_weight} hard_ce={comp_hard} '
+              f'pure polygons {int((comp_loss.pure_class >= 0).sum())}/{len(_ds.bag_Q)}')
+
     # 区域级 SupCon 辅助损失：segformer_supcon 时 forward 在训练态多返回 '_supcon'
     # （stride-4 投影特征），以 λ 加权进总 loss。验证 loss 不含本项。
     supcon_enabled = bool(train_options.get('segformer_supcon', False))
@@ -318,6 +336,7 @@ def train(cfg, train_options, net, device, dataloader_train, dataloader_val, opt
         dann_loss_sum = torch.tensor([0.])
         dann_correct = torch.zeros((), device=device)
         dann_seen = torch.zeros((), device=device)
+        comp_sums = {'loss': 0.0, 'l_prop': 0.0, 'l_ord': 0.0, 'tv': 0.0, 'bags': 0, 'batches': 0}
         if dann_enabled:
             # 写在 net_val 上：compile_model 时 net 是 OptimizedModule 包装。
             # resume 时 epoch 从 checkpoint 续，ramp 自然接上。
@@ -350,6 +369,8 @@ def train(cfg, train_options, net, device, dataloader_train, dataloader_val, opt
                     primary_epoch_class_counts[c] += int((primary_batch == c).sum().item())
                 primary_epoch_mask_count += int((primary_batch == 255).sum().item())
 
+            bag_dev = batch_y['_bag'].to(device, non_blocking=True) if comp_loss is not None else None
+
             with torch.cuda.amp.autocast():
                 output = net(batch_x)
 
@@ -377,6 +398,14 @@ def train(cfg, train_options, net, device, dataloader_train, dataloader_val, opt
                                 f'255=ignore 已排除）。检查 .nc 里该变量的取值口径 '
                                 f'或 n_classes 配置。')
                         if not _has_valid:
+                            continue
+                    elif comp_loss is not None and comp_hard != 'all':
+                        if comp_hard == 'none':
+                            primary_ce_batch = torch.zeros((), device=device)
+                            continue
+                        y_chart = comp_loss.pure_only(y_chart, bag_dev)
+                        if not bool((y_chart != 255).any()):
+                            primary_ce_batch = torch.zeros((), device=device)
                             continue
                     _ce_chart = loss_ce_functions[chart](output[chart], y_chart)
                     cross_entropy_loss += weight * _ce_chart
@@ -434,6 +463,11 @@ def train(cfg, train_options, net, device, dataloader_train, dataloader_val, opt
                     dann_hits_b = (_dlogits.argmax(dim=1) == _dom).sum()
                     dann_seen_b = _dom.numel()
 
+            comp_loss_b, comp_stats = None, None
+            if comp_loss is not None:
+                comp_loss_b, comp_stats = comp_loss(output[target_chart], bag_dev)
+                train_loss_batch = train_loss_batch + comp_weight * comp_loss_b
+
             optimizer.zero_grad()
 
             if not torch.isfinite(train_loss_batch):
@@ -484,6 +518,11 @@ def train(cfg, train_options, net, device, dataloader_train, dataloader_val, opt
                 scale_reg_loss_sum += scale_reg_loss.detach().item()
                 scale_reg_cls_sum += scale_reg_stats['cls_sum']
                 scale_reg_cls_cnt += scale_reg_stats['cls_cnt']
+            if comp_loss_b is not None:
+                comp_sums['loss'] += float(comp_loss_b.detach())
+                comp_sums['batches'] += 1
+                for k in ('l_prop', 'l_ord', 'tv', 'bags'):
+                    comp_sums[k] += comp_stats.get(k, 0)
             if loss_dann is not None:
                 dann_loss_sum += loss_dann.detach().item()
                 dann_correct += dann_hits_b
@@ -561,6 +600,16 @@ def train(cfg, train_options, net, device, dataloader_train, dataloader_val, opt
                                    else float('nan'),
                 "DANN Lambda": float(getattr(net_val, 'dann_lambda', 0.0)),
             }
+
+        comp_log = {}
+        if comp_loss is not None:
+            _cb = max(comp_sums['batches'], 1)
+            comp_log = {'Composition Loss': comp_sums['loss'] / _cb,
+                        'Composition Prop Loss': comp_sums['l_prop'] / _cb,
+                        'Composition Ord Loss': comp_sums['l_ord'] / _cb,
+                        'Composition TV': comp_sums['tv'] / _cb,
+                        'Composition Bags per Batch': comp_sums['bags'] / _cb}
+            print('[Composition] ' + ' | '.join(f'{k.split(" ", 1)[1]} {v:.4f}' for k, v in comp_log.items()))
 
         # 模型自带的训练前向统计（epoch 均值）。pop_sk_stats 会清零累加器，所以每个 epoch
         # 恰好取一次，放在 do_validate 分支之前，两条 wandb.log 路径共用。
@@ -663,7 +712,7 @@ def train(cfg, train_options, net, device, dataloader_train, dataloader_val, opt
                        "Train Cross Entropy Epoch Loss": cross_entropy_epoch,
                        "Learning Rate": optimizer.param_groups[0]["lr"],
                        **supcon_log, **scale_reg_log, **sk_log, **aux_log,
-                       **gn_log, **dann_log}, step=epoch)
+                       **gn_log, **dann_log, **comp_log}, step=epoch)
             print(f"Train Epoch Loss: {train_loss_epoch:.3f}")
             print(f"Grad Norm (pre-clip mean): {gn_log['Grad Norm']:.3f} | "
                   f"Clip Hit Frac: {gn_log['Clip Hit Frac']:.3f} | Nonfinite Frac: "
@@ -902,7 +951,7 @@ def train(cfg, train_options, net, device, dataloader_train, dataloader_val, opt
                    "Validation Cross Entropy Epoch Loss": val_cross_entropy_epoch,
                    "Learning Rate": optimizer.param_groups[0]["lr"],
                    **supcon_log, **scale_reg_log, **sk_log, **aux_log,
-                   **gn_log, **dann_log}, step=epoch)
+                   **gn_log, **dann_log, **comp_log}, step=epoch)
         print(f"Grad Norm (pre-clip mean): {gn_log['Grad Norm']:.3f} | "
               f"Clip Hit Frac: {gn_log['Clip Hit Frac']:.3f} | Nonfinite Frac: "
               f"{gn_log['Grad Nonfinite Frac']:.3f} (max_norm={grad_clip_max_norm})")

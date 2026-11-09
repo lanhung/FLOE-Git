@@ -28,6 +28,7 @@ from scipy.ndimage import binary_erosion as _scipy_binary_erosion
 
 # -- Proprietary modules -- #
 from floe.functions import rand_bbox
+from floe.composition import BAG_OFFSET
 
 
 # Byte-bounded LRU cache of decoded scenes for the legacy (non-tile) sampler,
@@ -658,6 +659,41 @@ class AI4ArcticChallengeDataset(Dataset):
                 '请给 config 配 tile_index_path（FLOE 一律走 tile 采样），或关掉 '
                 'segformer_dann。')
 
+        # Chart-composition supervision: polygon ids travel with the labels as one extra
+        # channel (global id + BAG_OFFSET), so flips, rotations and cutmix move them
+        # together with the labels. See floe/composition.py.
+        self._comp_on = bool((self.options.get('composition_supervision') or {}).get('enabled', False))
+        self._n_extra = 1 if self._comp_on else 0
+        if self._comp_on:
+            if not self._tile_sampling:
+                raise ValueError('composition_supervision needs tile sampling (tile_index_path).')
+            self._init_composition()
+
+    def _init_composition(self):
+        cfg = self.options['composition_supervision']
+        chart_dir = cfg['chart_dir']
+        Q, U, base = [], [], []
+        n = 0
+        for f in self.files:
+            path = os.path.join(chart_dir, os.path.splitext(f)[0] + '.chart.h5')
+            with h5py.File(path, 'r') as h:
+                q = h['composition'][...].astype(np.float32)
+                u = h['unknown'][...].astype(np.float32)
+            Q.append(q); U.append(u); base.append(n)
+            n += len(q)
+        if n + BAG_OFFSET >= 2 ** 24:
+            raise ValueError(f'{n} polygons do not fit in a float32 label channel')
+        self.bag_Q = np.concatenate(Q) if Q else np.zeros((0, 6), np.float32)
+        self.bag_U = np.concatenate(U) if U else np.zeros(0, np.float32)
+        self._bag_base = np.asarray(base, dtype=np.int64)
+        self._chart_dir = chart_dir
+        print(f'[Composition] {n} polygons over {len(self.files)} scenes from {chart_dir}', flush=True)
+
+    def _read_bag_tile(self, scene_id, r, c, T):
+        path = os.path.join(self._chart_dir, os.path.splitext(self.files[scene_id])[0] + '.chart.h5')
+        pid = _get_h5_handle(path)['polygon_id'][r:r + T, c:c + T].astype(np.int64)
+        return np.where(pid >= 0, pid + self._bag_base[scene_id] + BAG_OFFSET, 0).astype(np.float32)
+
     def _init_tile_sampling(self):
         opts = self.options
         ps = opts['patch_size']
@@ -959,9 +995,11 @@ class AI4ArcticChallengeDataset(Dataset):
         handle = _get_h5_handle(path)
 
         full_variables = self.options['full_variables']
-        tile = np.empty((len(full_variables), T, T), dtype=np.float32)
+        tile = np.empty((len(full_variables) + self._n_extra, T, T), dtype=np.float32)
         for j, var in enumerate(full_variables):
             tile[j] = handle[var][r:r + T, c:c + T]
+        if self._comp_on:
+            tile[-1] = self._read_bag_tile(scene_id, r, c, T)
         return tile, scene_id
 
     def _crop_from_tile(self, tile):
@@ -1001,6 +1039,10 @@ class AI4ArcticChallengeDataset(Dataset):
                 patch[self._target_chart_idx], erosion_iters=_erode_iters)
 
         # patch 已是 float32，from_numpy 零拷贝。
+        if self._n_extra:   # the bag channel is the last tile channel; it belongs to y
+            x_patch = torch.from_numpy(patch[n_charts:-self._n_extra]).unsqueeze(0)
+            y_patch = torch.from_numpy(np.concatenate([patch[:n_charts], patch[-self._n_extra:]])).unsqueeze(0)
+            return x_patch, y_patch
         x_patch = torch.from_numpy(patch[n_charts:]).unsqueeze(0)
         y_patch = torch.from_numpy(patch[:n_charts]).unsqueeze(0)
         return x_patch, y_patch
@@ -1019,7 +1061,7 @@ class AI4ArcticChallengeDataset(Dataset):
         batch_size = self.options['batch_size']
         ps = self.options['patch_size']
         x_patches = torch.zeros((batch_size, _n_channels, ps, ps))
-        y_patches = torch.zeros((batch_size, len(self.options['charts']), ps, ps))
+        y_patches = torch.zeros((batch_size, len(self.options['charts']) + self._n_extra, ps, ps))
         # segformer_dann 的逐 patch 域序号（self.files 下标）；关闭时为 None。
         domains = torch.zeros(batch_size, dtype=torch.long) if self._dann_on else None
 
@@ -1085,6 +1127,10 @@ class AI4ArcticChallengeDataset(Dataset):
         y = {}
         for idx, chart in enumerate(self.options['charts']):
             y[chart] = y_patches[:, idx].type(torch.long)
+
+        if getattr(self, '_comp_on', False):
+            v = y_patches[:, len(self.options['charts'])].type(torch.long)
+            y['_bag'] = torch.where(v >= BAG_OFFSET, v - BAG_OFFSET, torch.full_like(v, -1))
 
         # 下划线前缀的保留键：训练循环只按 charts 遍历 y，'_domain' 只由 DANN 分支取用。
         if domains is not None:

@@ -12,6 +12,9 @@ export FLOE_CM_DIR=${FLOE_CM_DIR:-$FLOE_ROOT/cm}
 # AI4Arctic / AutoICE benchmark in FLOE format (tools.data.convert_ai4arctic)
 export FLOE_A4A_DIR=${FLOE_A4A_DIR:-$FLOE_ROOT/ai4arctic/floe_format}
 export FLOE_A4A_TILE_INDEX=${FLOE_A4A_TILE_INDEX:-$FLOE_ROOT/ai4arctic/floe_tile_index_a4a.npz}
+export FLOE_POOL_DIR=${FLOE_POOL_DIR:-$FLOE_ROOT/pooled}            # symlinks to both archives
+export FLOE_POOL_TILE_INDEX=${FLOE_POOL_TILE_INDEX:-$FLOE_ROOT/pooled_tile_index.npz}
+export FLOE_CHART_DIR=${FLOE_CHART_DIR:-$FLOE_ROOT/charts}           # <scene>.chart.h5 (egg-code compositions)
 export FLOE_FIG_DIR=${FLOE_FIG_DIR:-$FLOE_ROOT/figs}
 export FLOE_LOG_DIR=${FLOE_LOG_DIR:-$FLOE_ROOT/logs}
 # huggingface.co is not reachable from this server; the mirror is.

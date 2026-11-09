@@ -16,19 +16,14 @@
 | 8 | 证据替换的均值在被评分的验证景上估计；sub-all/gate 并非干净移除 | `evidence_ablation.py --mean-list`（用该折训练景）；论文只引 */both |
 | 9 | 类别与地域完全混杂：big/vast 全部来自 19 景加拿大北极；big 仅 12 景、vast 仅 9 景 | 写入 Limitations；逐类结论以五折为准 |
 
-## 1. 准备状态（2026-11-09 晚）
+## 1. 准备状态（2026-11-10）
 
-- [x] 服务器 `gpu.chzmark.com:2338`：4× RTX 5000 Ada，见 `docs/ENVIRONMENT.md`。仓库部署在 `/root/autodl-tmp/WannianLi/FLOE/FLOE-Git`。
-- [x] 环境 `FLOE/envs/ice-binary`（`tools/system/setup_env.sh`；隔离了 root 的 `~/.local`，否则其他项目的包排在环境前面）。ImageNet 权重（mit_b2、resnet50）已缓存，`floe_env.sh` 默认离线。
-- [x] CPU 检查全部通过：`smoke_pgsg`（含 [E] 无证据对照：t=0 输出与 Baseline 逐位相同）、`radiometric --self-test`（含 dB 模式）、`paired_cv --self-test`、`evidence_ablation --self-test`。
-- [x] GPU 端到端 `smoke_pipeline`：Baseline / PGSG / PGSG 无证据 均 PASS（已到达的场景子集）。
-- [x] 数据流一致性 `tools.checks.seed_stream`：修复后三种配置前 3 个 batch 哈希完全相同；`--legacy`（旧行为）三者各不相同，证实了历史消融的混杂。
-- [x] 归一化统计量：NC 属性与手册一致（HH −13.9018/8.3349，HV −27.0105/9.4454 dB）。
-- [x] fold 0 名单：由三份 fold-0 诊断日志恢复（83 验证景，334 训练景，无共享 datatake），见 `datalists/cv5/README.md`。
-- [x] 已布置 `tmux floe-launch`：fold 0 全部 417 景到齐且可读后，按 20 分钟间隔在 GPU 0–3 启动 (a)(c)(c′)(b′)，seed 42。日志 `FLOE/logs/wait_and_launch_f0_s42.log`；取消：`tmux kill-session -t floe-launch`。
-- [x] 压缩副本 `FLOE/data_q10`（2.4× 更小，解码更快，误差 ≤0.005 dB，标签/掩膜逐位相同；`DATASET_HANDBOOK.md` §11）。`tmux floe-compress` 随传输逐景转换并逐文件核对；`floe-launch` 等待的是压缩副本。原始文件待全部 run 完成后再决定是否删除（约 360 GB）。
-- [ ] 数据传输：rsync 进行中（约 46 景/小时）。`python -m tools.data.check_transfer --data-dir $FLOE_DATA_DIR --open -1`。
-- [ ] fold 1–4 名单：原始 `fold*_*.json`，或旧 CM（`Data/cm/cv5/*.npz`，随传输到达）经 `tools.data.folds_from_cm` 恢复；分组文件（场景→组）若有一并放入。
+- 服务器、环境、压缩副本、AutoICE 均已就绪，见 `docs/ENVIRONMENT.md`。417 景原始 NC 传输完成；压缩副本 `data_q10` 随 `tmux floe-compress` 生成（19 个较新的景另带 SIC/SOD 层，逐位复制）。
+- 自检全部通过：`smoke_pgsg`、`smoke_degrade`、`seed_stream`（三种配置数据流逐位相同）、`paired_cv`/`radiometric`/`evidence_ablation --self-test`，GPU `smoke_pipeline`（PGSG、AutoICE、res160）。
+- 代码清理前后，五个配置的模型初始化、训练 batch、首批 logits 与 loss、验证样本的哈希逐位相同。
+- GPU 队列 `tools/system/queues/main_2026-11.txt`（`tmux floe-queue`）；AutoICE baseline / PGSG 已在 GPU 0/1 训练。
+- [ ] fold 1–4 名单（原始 json，或由旧 CM 经 `tools.data.folds_from_cm` 恢复）。
+- [ ] 数据构建代码 / 冰图属性（egg code）：组成监督的前提，见 §6。
 
 ## 2. Phase 1：决定论文定位的实验（GPU）
 
@@ -99,3 +94,35 @@ python -m tools.analysis.paired_cv --a "$FLOE_CM_DIR/cv5/baseline_s42_f{K}.npz" 
 3. **混合标签学习**（待数据）：用冰图部分浓度（Ca/Fa、Cb/Fb、Cc/Fc）做软标签 + 多边形级评估，直接针对 medium↔small 混淆。AutoICE raw 有多边形编码；本档案需要原作者的数据构建代码（不在本仓库）。
 
 GPU 队列：`tools/system/queues/main_2026-11.txt`，`tmux floe-queue`；`bash tools/system/run_queue.sh <queue> --check` 查看状态。
+
+
+## 6. 方法：冰图组成监督（2026-11-10 起）
+
+文献综述（`reports/` 下的调研报告，未入库）的结论：FLOE 的瓶颈在标签语义与数据覆盖，不在网络结构。
+AutoICE 冠军的 FLOE 只有 70.70%（最好 79.12%），top-5 对 cake/small/medium 的类准确率仅 14–21%；
+组成感知的监督已在 SOD/SIC 上把少数类 F1 提高一倍以上，但从未用于 FLOE，也没有与尺寸序结合。
+
+### 6.1 方法
+
+- 每个冰图多边形由 egg code 得到 6 类组成 q（water = 1 − CT；FA/FB/FC × CA/CB/CC；无法映射的形态记为未知冰量 u）。
+- 损失（`floe/composition.py`）：多边形均值预测与 q 的交叉熵（LLP）+ 冰类累积分布的序损失（cake < small < medium < big < vast）；
+  纯多边形（某类 ≥ 0.9）保留逐像素 CE；未知冰量按当前预测分配到冰类。
+- 实现：多边形 id 作为额外标签通道随翻转、旋转、cutmix 一起变换（`smoke_composition` [D] 验证对齐）；
+  关闭时数据流与模型初始化逐位不变。
+- 数据：每景一个 `<scene>.chart.h5`（`polygon_id` 栅格 + `composition`[P,6] + `unknown`[P]），由数据构建代码生成。
+
+### 6.2 实验
+
+| 对比 | 回答的问题 |
+|---|---|
+| baseline vs comp（同输入、同协议，五折配对） | 组成监督是否改善 medium↔small 与跨景泛化 |
+| comp vs comp(w_ord=0) / comp(hard_ce=all) | 序项与纯多边形约束各自的作用 |
+| res80 vs pooled（本档案 + AutoICE train） | 补上 DMI 区域的 big/vast 能否打破类别-地域混杂 |
+| res80 / pooled / a4a_baseline 在两侧测试集上交叉评估 | 跨时期、跨冰图服务的迁移 |
+
+### 6.3 评估（两条轴都要报）
+
+- 像素级：沿用主导类标签，macro mIoU、逐类 IoU/F1、hard-ice；AutoICE 测试集另报官方 weighted F1。
+- 多边形级（`tools.evaluate --composition-dir`）：预测组成与冰图组成的 TV 距离（像元加权与多边形平均）、冰类 CDF 的 EMD、
+  纯/混合多边形的主导类一致率。基线用同一脚本重评，公平比较。
+- 统计：五折配对（`paired_cv`），按区域与冰图服务分开报告。
