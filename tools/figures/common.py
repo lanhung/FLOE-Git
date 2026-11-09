@@ -1,11 +1,9 @@
-"""论文绘图/统计脚本的公共设置（无卡模式安全：CPU、单进程、低内存）。
+"""论文绘图/统计脚本的公共设置：路径、类别配色、matplotlib 样式与读图小工具。
 
-⚠️ 无卡模式只有 0.5 核 / 2GB 内存。本模块及所有 `_paper_*` 脚本遵守：
-  - 只用 h5py 切片读，**绝不整景解码**（一景 float32 约 3GB，当场 OOM）；
-  - 不开多进程；matplotlib 强制 Agg 后端；
-  - 输出同时落 PDF（LaTeX 用矢量图）与 PNG（预览/scp 回本地看）。
+为在 0.5 核 / 2GB 的 CPU 机器上也能跑：只用 h5py 切片读对齐 tile，不整景解码（一景 float32
+约 3GB）；不开多进程；matplotlib 用 Agg 后端；图同时存 PDF（LaTeX 用矢量图）与 PNG。
 
-用法：各脚本 `from _paper_figs_common import *`。
+用法：各脚本 `from tools.figures.common import *`。
 """
 import os
 import os.path as osp
@@ -15,14 +13,14 @@ matplotlib.use('Agg')                      # 无显示环境必须
 import matplotlib.pyplot as plt
 import numpy as np
 
-# ---------------------------------------------------------------- 路径
+# 路径
 DATA_DIR = os.environ.get('FLOE_DATA_DIR', '/root/autodl-tmp/FLOE_datanc')
 TILE_INDEX = os.environ.get('FLOE_TILE_INDEX',
                             '/root/autodl-tmp/floe_tile_index_417.npz')
 CM_DIR = os.environ.get('FLOE_CM_DIR', '/root/autodl-tmp/cm/single')
 FIG_DIR = os.environ.get('FLOE_FIG_DIR', '/root/autodl-tmp/figs')
 
-# ---------------------------------------------------------------- 类别
+# 类别
 N_CLASSES = 6
 CLASS_NAMES = ['Open water', 'Cake ice', 'Small floe',
                'Medium floe', 'Big floe', 'Vast floe']
@@ -34,7 +32,7 @@ IGNORE_COLOR = '#d9d9d9'
 
 PIXEL_M = 80.0                              # 像元边长（米）
 
-# ---------------------------------------------------------------- 样式
+# 样式
 plt.rcParams.update({
     'font.size': 8,
     'axes.titlesize': 8,
@@ -62,8 +60,8 @@ def savefig(fig, name):
 
 
 def load_tile_index(path=TILE_INDEX):
-    """载入 tile 索引。字段见 scan_tiles.py：
-    scene_id / row / col / valid_ratio / label_valid_ratio / hist (n,6) / hist_w / files.
+    """载入 tile 索引（格式见 tools/data/scan_tiles.py）：
+    scene_id / row / col / valid_ratio / label_valid_ratio / hist (n,6) / files / tile_size。
     """
     d = np.load(path, allow_pickle=True)
     return {
@@ -79,10 +77,7 @@ def load_tile_index(path=TILE_INDEX):
 
 
 def read_tile(scene_file, row, col, size, variables):
-    """h5py 只读一个对齐 tile 的若干变量。返回 dict[var] -> (size, size) 数组。
-
-    ⚠️ 这是无卡模式下唯一允许的读法：每变量一个 chunk，约 1MB。
-    """
+    """h5py 只读一个对齐 tile 的若干变量（每变量一个 chunk，约 1MB）。返回 dict[var] -> (size, size)。"""
     import h5py
     out = {}
     with h5py.File(osp.join(DATA_DIR, scene_file), 'r') as f:
@@ -118,12 +113,8 @@ def stretch(img, valid=None, lo=2, hi=98):
 
 
 def resolve_ckpt(run_name, explicit=None):
-    """按实验名找 best checkpoint。
-
-    项目里两种写法都出现过——CLAUDE.md 记的是 `work_dirs/<名>/best_model_<名>.pth`，
-    而 pgsg 系 config 头部的用法示例写的是 `work_dir/<名>`。这里把候选都试一遍，
-    免得开卡后因为一个目录名少个 s 而白跑一趟。
-    """
+    """按实验名找 best checkpoint：explicit 存在则用它，否则依次试 work_dirs/ 与 work_dir/
+    下的常见路径，最后递归搜索 best_model_<名>.pth。"""
     import glob
     if explicit:
         if osp.exists(explicit):

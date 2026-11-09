@@ -1,24 +1,17 @@
-"""T0-0.4：参数量统计（PGSG 主模型 vs 基线）。无卡模式可跑（CPU，只构模型不前向）。
+"""参数量统计：PGSG 主模型 vs 基线，按新增模块归并。CPU 可跑，只构模型不前向。
 
-产出论文 §4.4 / §4.6 需要的三个数里的两个：**各新增模块的参数量**与**全模型总参数量**。
-FLOPs 需要一次前向，默认**不做**（无卡只有 0.5 核 / 2GB，容易超时或 OOM）；
-开卡时加 --flops 即可。
+--flops 额外做一次前向统计 MACs（需 fvcore 或 thop）。构模型时强制 segformer_encoder_weights=None：
+参数量与预训练权重无关，这样不会触发权重下载。
 
-⚠️ 构模型时强制 `segformer_encoder_weights=None`：参数量与是否加载预训练权重无关，
-但 'imagenet' 会触发一次权重下载，无卡模式下没必要。
-
-用法
-----
-    python -m tools.analysis.parameters
-    python -m tools.analysis.parameters --flops                 # 开卡时再加
-    python -m tools.analysis.parameters --pgsg <cfg> --baseline <cfg>
+用法：
+    python -m tools.analysis.parameters [--pgsg <cfg>] [--baseline <cfg>] [--flops]
 """
 import argparse
 import copy
 
 from mmcv import Config
 
-from floe.loaders import limit_torch_threads, get_variable_options  # 新入口必须先限线程（CLAUDE.md）
+from floe.loaders import limit_torch_threads, get_variable_options  # 入口先限线程
 
 limit_torch_threads()
 
@@ -64,12 +57,9 @@ def by_module(net):
 
 
 def input_channels(opts):
-    """网络实际吃的通道数。
-
-    ⚠️ 不等于 len(train_variables)：loaders._augment_x 会在后面追加派生通道
-    （month_encoding ×2 / pol_ratio ×1），顺序与 _eval_radiometric.channel_layout 一致。
-    本项目 FLOE 的实际值是 8 = 7 个 train_variables + pol_ratio。
-    （论文口径的"7 通道"是另一回事：它不计 global_valid_mask、但计 pol_ratio。）
+    """网络实际输入的通道数：train_variables 加 loaders._augment_x 追加的派生通道
+    （month_encoding ×2、pol_ratio ×1；顺序同 tools.analysis.radiometric.channel_layout）。
+    FLOE 上为 8 = 7 个 train_variables + pol_ratio；论文说的 7 通道不计 global_valid_mask。
     """
     return (len(opts['train_variables'])
             + (2 if opts.get('month_encoding', False) else 0)

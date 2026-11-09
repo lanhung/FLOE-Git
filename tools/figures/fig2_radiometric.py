@@ -1,22 +1,12 @@
-"""Fig. 2：辐射动机图——同一场景在不同辐射水平下模型判读翻转。**需要 GPU**。
+"""Fig. 2：同一场景只平移整景辐射水平（±0.7 z-unit，HH 约 ±5.8 dB），中浮冰判读就翻转。需要 GPU。
 
-对应论文动机 B：尺度证据被场景辐射条件污染。图上直接给出"同一块冰、只把整景亮度
-平移 ±0.7 z-unit（≈±4 dB），预测就从 medium 翻成 small/water"的视觉证据。
+扰动复用 tools.analysis.radiometric.apply_radiometric（只动 HH/HV 的有效像元，pol_ratio 同步重算），
+与论文的 Δhard-ice 探针同一口径。两步：
 
-两步走
-------
-1) **扫描选景**（要 GPU，但只算指标、走门控，较快）：在 fold0 验证集里挑中浮冰支撑大的
-   场景，测它们在 b∈{−0.7, 0, +0.7} 下的 medium IoU，排出翻转最剧烈的一个：
+    python -m tools.figures.fig2_radiometric --scan            # 按 medium IoU 翻转幅度排序候选景
+    python -m tools.figures.fig2_radiometric --scene <name> [--crop r0,c0,size]   # 出图
 
-       python -m tools.figures.fig2_radiometric --scan
-
-2) **出图**（要 GPU）：对选定场景关门控重跑，画 1×4 [HH+GT | b−0.7 | b=0 | b+0.7]：
-
-       python -m tools.figures.fig2_radiometric --scene <name> [--crop r0,c0,size]
-
-⚠️ 扰动逻辑直接复用 `_eval_radiometric.apply_radiometric`，保证与论文里报的
-Δhard-ice 探针**逐位同一套口径**（只动 HH/HV 的有效像元，pol_ratio 同步重算）。
-⚠️ 出图时 `gate=False`：开门控会把标签全 255 的 tile 跳过、预测留 0，画整景会出现假"水"。
+出图时 gate=False：门控会跳过标签全 255 的 tile、预测留 0，画整景会出现假"水"。
 """
 import argparse
 import copy
@@ -40,7 +30,7 @@ RUN = 'floe_baseline_417_s42'
 VAL_LIST = 'datalists/val_417.json'
 MEDIUM = 3
 
-# 论文图用的三个操作点（与 08-04 因果探针同幅度）
+# 论文图用的三个操作点
 SHIFTS = [('$-0.7$ z-unit', -0.70), ('unchanged', 0.0), ('$+0.7$ z-unit', +0.70)]
 
 
@@ -59,8 +49,8 @@ def load_net(device, ckpt=None):
 
 
 def predict(x, net, opts, labels, cfv_masks, gate):
-    """⚠️ valid_maps 要传 `~cfv_masks`（与 quickstart / _eval_radiometric 同口径）。
-    扫描阶段 gate=True（只要指标，快）；出图阶段必须 gate=False（否则整景有假"水"）。
+    """valid_maps 用 ~cfv_masks（与训练验证、tools.analysis.radiometric 同口径）。
+    扫描时 gate=True（只要指标）；出图必须 gate=False（否则整景有假"水"）。
     """
     valid_maps = {c: ~cfv_masks[c] for c in opts['charts']}
     with torch.no_grad(), torch.cuda.amp.autocast():
@@ -145,7 +135,7 @@ def main():
         if args.scan:
             continue
 
-        # ---- 出图 ----
+        # 出图
         feats = (inf_x[0] if inf_x.dim() == 4 else inf_x).numpy()
         hh, gvm = feats[0], feats[gvm_idx] > 0.5
         arrs = [hh, gvm, gt] + preds

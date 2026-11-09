@@ -1,26 +1,12 @@
-"""Fig. 4：变异函数剖面示意——归一化如何扔掉幅度、只留形状。无卡模式安全。
+"""Fig. 4：变异函数剖面示意：跨 lag 归一化去掉幅度、只留形状。CPU 可跑。
 
-⚠️ 口径声明（图注里必须写）
---------------------------------
-论文里的 variogram 模块作用在 **encoder 的 stride-4 特征** 上；无卡模式跑不了 encoder，
-所以本图把**同一个构造**作用在输入的 HH 通道上，并先做 4×4 平均池化以对齐到同样的
-320 m 网格。图注写法建议：
+模块实际作用在 encoder 的 stride-4 特征上；本图把同一构造作用在 4×4 平均池化后的 HH 通道上
+（同为 320 m 网格），图注需说明这一点。
+  (a) log10 γ_r：同类不同景之间整体上下平移（辐射条件带来的幅度差异）；
+      虚线是 f -> a·f + b 后的同一 tile。
+  (b) v_r：仿射变换前后重合（仿射不变），类别之间按形状分开。
 
-    "Illustration of the construction of Section 4.2 applied to the (4x-pooled) HH
-     channel, which shares the 320 m grid of the stride-4 encoder features on which
-     the module actually operates."
-
-图的内容
---------
-(a) log10 γ_r：三个类别的原始结构函数。同类不同景之间存在明显的**整体上下平移**——
-    那就是辐射条件带来的幅度差异；虚线是人为施加 f -> a·f + b 后的同一 tile。
-(b) v_r（跨 lag 归一化后的剖面）：虚线与实线**完全重合**（仿射不变），且类别之间按
-    形状分开——这正是模块只保留"相关长度/纹理粗细"的含义。
-
-用法
-----
-    python -m tools.figures.fig4_variogram
-    python -m tools.figures.fig4_variogram --classes 2 3 4 --per-class 5
+用法：python -m tools.figures.fig4_variogram [--classes 2 3 4] [--per-class 5]
 """
 import argparse
 

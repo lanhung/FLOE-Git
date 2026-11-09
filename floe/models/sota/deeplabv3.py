@@ -38,7 +38,9 @@ class DeepLabV3Plus(nn.Module):
         self.models = nn.ModuleDict({
             chart: smp.DeepLabV3Plus(
                 encoder_name='resnet50',
-                encoder_weights=None,
+                # Optional ImageNet init, for a like-for-like comparison with the
+                # ImageNet-initialised SegFormer; None trains the encoder from scratch.
+                encoder_weights=options.get('deeplab_encoder_weights', None),
                 in_channels=in_ch,
                 classes=self.n_classes[chart],
             )

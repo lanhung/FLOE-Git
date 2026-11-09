@@ -1,3 +1,5 @@
+"""Segmentation losses; most are selected by name (chart_loss 'type') via floe.functions.get_loss."""
+
 __author__ = 'Muhammed Patel'
 __contributor__ = 'Xinwwei chen, Fernando Pena Cantu,Javier Turnes, Eddie Park'
 __copyright__ = ['university of waterloo']
@@ -11,6 +13,8 @@ import torch.nn.functional as F
 
 
 class OrderedCrossEntropyLoss(nn.Module):
+    """Per-pixel CE weighted by 1 + |argmax - target|, averaged over non-ignored pixels."""
+
     def __init__(self, ignore_index=-100):
         super(OrderedCrossEntropyLoss, self).__init__()
         self.ignore_index = ignore_index
@@ -19,19 +23,14 @@ class OrderedCrossEntropyLoss(nn.Module):
 
         criterion = nn.CrossEntropyLoss(reduction='none', ignore_index=self.ignore_index)
         loss = criterion(output, target)
-        # calculate the hard predictions by using softmax followed by an argmax
         softmax = torch.nn.functional.softmax(output, dim=1)
         hard_prediction = torch.argmax(softmax, dim=1)
-        # set the mask according to ignore index
         mask = target == self.ignore_index
         hard_prediction = hard_prediction[~mask]
         target = target[~mask]
-        # calculate the absolute difference between target and prediction
         weights = torch.abs(hard_prediction-target) + 1
-        # remove ignored index losses
         loss = loss[~mask]
-        # if done normalization with weights the loss becomes of the order 1e-5
-        # loss = (loss * weights)/weights.sum()
+        # Plain mean: normalising by weights.sum() shrinks the loss to ~1e-5.
         loss = (loss * weights)
         loss = loss.mean()
 
@@ -54,41 +53,27 @@ class MSELossFromLogits(nn.Module):
             self.num_classes = 8
         else:
             raise NameError(f'The chart {self.chart} is not recognized')
-        
-        # Create class weights for expectation calculation: [0, 1, 2, ..., N-1]
+
+        # Class indices [0, 1, ..., N-1] for the expected-value prediction.
         self.register_buffer('class_weights', torch.arange(self.num_classes).float())
 
     def forward(self, output: torch.Tensor, target: torch.Tensor):
-        """
-        Calculate MSE/Distance loss treating the classification problem as an ordinal regression.
-        Instead of One-Hot MSE, we calculate the expected class value from the softmax distribution
-        and compare it to the ground truth class index.
-        """
-        # Create a mask for valid pixels (not ignore_index)
+        """Ordinal regression: MSE between the softmax expected class E[c] and the true index."""
         valid_mask = (target != self.ignore_index)  # (B, H, W)
 
-        # If no valid pixels, return zero loss
         if valid_mask.sum() == 0:
             return torch.tensor(0.0, device=output.device, requires_grad=True)
 
-        # Select valid pixels
-        # output shape: (B, C, H, W) -> permute to (B, H, W, C) -> mask to (N_valid, C)
-        output_valid = output.permute(0, 2, 3, 1)[valid_mask] # (N_valid, num_classes)
-        target_valid = target[valid_mask].float()             # (N_valid,)
+        output_valid = output.permute(0, 2, 3, 1)[valid_mask]  # (N_valid, num_classes)
+        target_valid = target[valid_mask].float()              # (N_valid,)
 
-        # Calculate Softmax probabilities
-        probs = F.softmax(output_valid, dim=1)  # (N_valid, num_classes)
+        probs = F.softmax(output_valid, dim=1)
+        pred_expected = torch.sum(probs * self.class_weights.to(output.device), dim=1)  # (N_valid,)
 
-        # Calculate Expected Value (Soft Prediction)
-        # E[x] = sum(p_i * i)
-        # self.class_weights shape: (num_classes,)
-        # Ensure class_weights is on the same device
-        pred_expected = torch.sum(probs * self.class_weights.to(output.device), dim=1) # (N_valid,)
-
-        # Calculate MSE between Expected Value and True Class Index
         loss = F.mse_loss(pred_expected, target_valid)
 
         return loss
+
 
 class GCELoss(nn.Module):
     """Generalized Cross-Entropy Loss，对噪声标签具有鲁棒性。
@@ -96,9 +81,8 @@ class GCELoss(nn.Module):
     L = (1 - p_y^q) / q
     q=1 等价于 CE；q→0 等价于 MAE；推荐 q=0.7。
 
-    注意：GCE 在训练初期梯度较弱（p_y 小时梯度趋近 0），从零训练时可能导致
-    收敛缓慢或崩溃。建议配合 warmup_epochs 使用：前 N epoch 用纯 CE，
-    之后切换到 GCE，或直接使用 label_smoothing 的 CrossEntropyLoss。
+    GCE 在训练初期梯度较弱（p_y 小时梯度趋近 0），从零训练可能收敛缓慢或崩溃，
+    所以前 warmup_epochs 个 epoch 用纯 CE。
 
     Args:
         q:             噪声鲁棒参数，q ∈ (0, 1]，越小越鲁棒。
@@ -131,7 +115,6 @@ class GCELoss(nn.Module):
         probs = F.softmax(inputs, dim=1)
         p_y = probs.gather(1, targets_safe.unsqueeze(1)).squeeze(1)   # [B, H, W]
 
-        # warmup 阶段用纯 CE（等价于 q=1）
         if self._current_epoch < self.warmup_epochs:
             loss = -torch.log(p_y.clamp(min=1e-7))
         else:
@@ -165,8 +148,7 @@ class FocalLoss(nn.Module):
             self.weight = None
 
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        # inputs : [B, C, H, W] logits
-        # targets: [B, H, W]   class indices
+        # inputs: [B, C, H, W] logits; targets: [B, H, W] class indices.
         valid_mask = targets != self.ignore_index          # [B, H, W]
         targets_safe = targets.clone()
         targets_safe[~valid_mask] = 0                      # prevent gather OOB
@@ -186,6 +168,7 @@ class FocalLoss(nn.Module):
 
 
 class WaterConsistencyLoss(nn.Module):
+    """Penalises disagreement of the water probability between SIC, SOD and FLOE heads."""
 
     def __init__(self):
         super().__init__()
@@ -193,7 +176,7 @@ class WaterConsistencyLoss(nn.Module):
         self.activation = nn.Softmax(dim=1)
 
     def forward(self, output):
-        # 需要至少3个任务才能计算跨任务水体一致性；单任务模式直接返回0
+        # 需要 3 个 chart；单任务模式返回 0。
         available = [k for k in self.keys if k in output]
         if len(available) < 3:
             return torch.tensor(0.0, device=next(iter(output.values())).device)
@@ -202,8 +185,10 @@ class WaterConsistencyLoss(nn.Module):
         floe = self.activation(output[available[2]])[:, 0, :, :]
         return torch.mean((sic-sod)**2 + (sod-floe)**2 + (floe-sic)**2)
 
-# only applicable to regression outputs
+
 class MSELossWithIgnoreIndex(nn.MSELoss):
+    """MSE over non-ignored pixels, for regression heads with output (B, H, W, 1)."""
+
     def __init__(self, ignore_index=255, reduction='mean'):
         super(MSELossWithIgnoreIndex, self).__init__(reduction=reduction)
         self.ignore_index = ignore_index
@@ -239,23 +224,20 @@ class EMDLoss(nn.Module):
         self.ignore_index = ignore_index
 
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        # inputs:  [B, C, H, W] logits
-        # targets: [B, H, W]   class indices
+        # inputs: [B, C, H, W] logits; targets: [B, H, W] class indices.
         valid_mask = targets != self.ignore_index           # [B, H, W]
         targets_safe = targets.clone()
         targets_safe[~valid_mask] = 0                       # prevent out-of-bounds gather
 
         probs = F.softmax(inputs, dim=1)                    # [B, C, H, W]
 
-        # Predicted CDF: cumulative sum over class dim; drop the last entry (always 1)
+        # Predicted CDF; the last entry is always 1 and is dropped.
         cdf_pred = torch.cumsum(probs, dim=1)[:, :-1, :, :]   # [B, K-1, H, W]
 
-        # True CDF: step function — CDF_true(k) = 1 if k >= true_class, else 0
-        # k ranges over 0..K-2
+        # True CDF over k = 0..K-2: 1 if k >= true class, else 0.
         class_range = torch.arange(self.num_classes - 1, device=inputs.device)  # [K-1]
         cdf_true = (class_range.view(1, -1, 1, 1) >= targets_safe.unsqueeze(1)).float()  # [B, K-1, H, W]
 
-        # EMD per pixel = L1 distance between the two CDFs summed over class cuts
         emd = torch.abs(cdf_pred - cdf_true).sum(dim=1)    # [B, H, W]
 
         emd = emd * valid_mask.float()

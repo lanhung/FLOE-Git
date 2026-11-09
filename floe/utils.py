@@ -1,15 +1,17 @@
+"""Ice-chart lookup tables, class names and small print helpers (from the AutoICE toolkit)."""
+
 CHARTS = [
     'SIC',
     'SOD' ,
     'FLOE'
 ]
-# 在AI4ArcticSeaIceChallenge-main中使用的场景变量
+# AI4Arctic challenge 的场景变量（本项目的输入变量在 configs/_base_/base.py 中定义）。
 SCENE_VARIABLES = [
     # -- Sentinel-1 variables（3个变量） -- #
-    'nersc_sar_primary', 
+    'nersc_sar_primary',
     'nersc_sar_secondary',
     'sar_incidenceangle',
-    
+
     # -- Geographical variables（1个变量） -- #
     'distance_map',
 
@@ -21,16 +23,16 @@ SCENE_VARIABLES = [
     'btemp_23_8h', 'btemp_23_8v',
     'btemp_36_5h', 'btemp_36_5v',
     'btemp_89_0h', 'btemp_89_0v',
-    
+
     # -- Environmental variables（6个变量） -- #
     'u10m_rotated', 'v10m_rotated',
     't2m', 'skt', 'tcwv', 'tclw',
 
-    # -- 新增的辅助变量 -- #
+    # -- Auxiliary variables -- #
     'aux_time',
     'aux_lat',
     'aux_long'
-]    
+]
 
 # Sea Ice Concentration (SIC) code to class conversion lookup table.
 SIC_LOOKUP = {
@@ -110,8 +112,8 @@ SOD_GROUPS = {
 }
 
 # Ice floe/form code to class conversion lookup table.
-# ⚠️ 数据预处理侧的表（仅 utils/convert_raw_icechart.py 使用，生成 .nc 标签 0-6，与 DATASET_HANDBOOK.md §4 对应）。
-# 训练侧类别权威是 configs/_base_/base.py 的 FLOE_LOOKUP（n_classes=6，标签 6 由 loader 重映射为 255），勿混用。
+# 数据预处理侧的码表（冰图代码 → .nc 标签 0-6，见 docs/DATASET_HANDBOOK.md §4）。训练侧以
+# configs/_base_/base.py 的 FLOE_LOOKUP 为准（n_classes=6，标签 6 由 loader 重映射为 255）。
 FLOE_LOOKUP = {
     'floe_partial_idx': [4, 7, 10],  # Partial SIC polygon code index. FA, FB, FC.
     'threshold': 0.65,  # < 1. Minimum partial concentration to select floe. Otherwise polygon may be ambiguous.
@@ -140,7 +142,7 @@ FLOE_LOOKUP = {
 # 数据集标签 6(冰山类) 在读取时重映射为 255 忽略，故此处不含 Bergs。
 FLOE_GROUPS = {
     0: 'Open water',
-    1: 'Cake Ice',       # 2026-07-16 数据集扩充后有像素（此前为空）
+    1: 'Cake Ice',
     2: 'Small floe',
     3: 'Medium floe',
     4: 'Big floe',

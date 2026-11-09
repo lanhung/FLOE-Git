@@ -1,5 +1,4 @@
-# Single-split PGSG evidence + gate ablation; no DANN or PBA.
-# Uses train_417.json / val_417.json. Historical paper fold-0 metrics do not apply.
+# PGSG ablation (b): evidence-conditioned softmax scale gate, no scale-axis transformer.
 _base_ = ['./sota_segformer_in1k_dlr_417.py']
 
 train_options = {

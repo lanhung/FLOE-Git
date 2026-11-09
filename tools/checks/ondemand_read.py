@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""临时诊断：验证「按需读」与整景读在【会被前向的 tile 内】逐位一致。
+"""验证「按需读」与整景读在会被前向的 tile 内逐位一致，并报告两条路径的耗时。
 
-对若干真实验证景，分别用 val_ondemand_read=False / True 走一遍 dataset，比较：
-  - y（标签）           : 必须【逐位相同】（两条路都整景读标签）
-  - cfv_masks / tfv_mask: 必须【逐位相同】
-  - x（输入）           : 在「有有效标签的 tile」内必须【逐位相同】；这些 tile 之外
-                          按需读留 0，本就不会进网络（functions.compute_valid_tile_mask）
-并报告两条路径各自的耗时。
+对若干真实验证景分别用 ondemand_read=False / True 构造 dataset：标签、cfv_masks、tfv_mask
+必须逐位相同；输入 x 在有有效标签的 tile 内必须逐位相同（其余位置按需读留 0，
+这些 tile 不进网络，见 functions.compute_valid_tile_mask）。
 
 用法：python -m tools.checks.ondemand_read --config <cfg> [--scenes 3]
 """

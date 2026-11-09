@@ -1,4 +1,4 @@
-"""SegNeXt-T (Guo et al., 2022) — pure PyTorch, no mmseg required.
+"""SegNeXt-T (Guo et al., 2022) in pure PyTorch (no mmseg required).
 
 Full MSCAN-T (Multi-Scale Convolutional Attention Network, Tiny) backbone
 implemented from scratch, with a simplified aggregation head.
@@ -11,18 +11,12 @@ MSCAN-T config:
 
 Head: projects stages 2-4 (channels [64, 160, 256]) to 256 ch,
 upsamples to stride-8 resolution, fuses and classifies.
-
-Only requires standard PyTorch — no extra dependencies.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-# --------------------------------------------------------------------------- #
-# Helpers
-# --------------------------------------------------------------------------- #
 
 class _DropPath(nn.Module):
     """Stochastic depth regularisation (per sample)."""
@@ -51,10 +45,6 @@ class _OPE(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.norm(self.proj(x))
 
-
-# --------------------------------------------------------------------------- #
-# MSCA (Multi-Scale Convolutional Attention)
-# --------------------------------------------------------------------------- #
 
 class _MSCA(nn.Module):
     """
@@ -130,14 +120,9 @@ class _MSCANBlock(nn.Module):
         return x
 
 
-# --------------------------------------------------------------------------- #
-# MSCAN-T backbone
-# --------------------------------------------------------------------------- #
-
 class _MSCAN_T(nn.Module):
-    """
-    MSCAN-T backbone — outputs 4 feature maps at strides [4, 8, 16, 32].
-    Channel dims: [32, 64, 160, 256].
+    """MSCAN-T backbone: 4 feature maps at strides [4, 8, 16, 32],
+    channels [32, 64, 160, 256].
     """
     _DIMS    = [32, 64, 160, 256]
     _DEPTHS  = [3,  3,  5,   2]
@@ -172,14 +157,9 @@ class _MSCAN_T(nn.Module):
         return feats   # [s1(32ch), s2(64ch), s3(160ch), s4(256ch)]
 
 
-# --------------------------------------------------------------------------- #
-# Aggregation head (simplified LightHamHead)
-# --------------------------------------------------------------------------- #
-
 class _AggHead(nn.Module):
-    """
-    Lightweight aggregation head: project each stage to head_ch,
-    upsample all to the finest stage resolution, fuse, classify.
+    """Simplified LightHamHead: project each stage to head_ch, upsample all to
+    the finest input stage, fuse, classify.
     """
 
     def __init__(self, in_channels: list, head_ch: int, n_classes: int):
@@ -216,16 +196,9 @@ class _AggHead(nn.Module):
         return x
 
 
-# --------------------------------------------------------------------------- #
-# SegNeXt
-# --------------------------------------------------------------------------- #
-
 class SegNeXt(nn.Module):
-    """
-    SegNeXt-T: MSCAN-T backbone + aggregation head.
-    Pure PyTorch — no mmseg required.
-
-    Head uses stages 2, 3, 4 (channels [64, 160, 256]).
+    """SegNeXt-T: MSCAN-T backbone + aggregation head on stages 2-4
+    (channels [64, 160, 256]).
     """
 
     def __init__(self, options: dict):
@@ -241,7 +214,6 @@ class SegNeXt(nn.Module):
 
         self.backbone = _MSCAN_T(in_ch=in_ch, drop_path_rate=0.1)
 
-        # Use the last 3 stages: channels [64, 160, 256]
         head_in_ch = [64, 160, 256]
         self.heads = nn.ModuleDict({
             chart: _AggHead(head_in_ch, 256, self.n_classes[chart])
@@ -249,7 +221,7 @@ class SegNeXt(nn.Module):
         })
 
     def forward(self, x: torch.Tensor) -> dict:
-        _, s2, s3, s4 = self.backbone(x)   # discard s1 (32ch, coarsest feature)
+        _, s2, s3, s4 = self.backbone(x)   # drop s1 (32 ch, stride 4)
         feats = [s2, s3, s4]
         h, w = x.shape[-2:]
         return {chart: self.heads[chart](feats, (h, w)) for chart in self.charts}
