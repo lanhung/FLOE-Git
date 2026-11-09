@@ -1,14 +1,15 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""PGSG-v4（v2 + 尺度轴 transformer，无 PBA）结构自检 —— CPU 可跑。
+"""PGSG 结构自检，CPU 可跑、无需数据。
+v2 = configs/FLOE/pgsg_evidence_gate.py，v4 = configs/FLOE/pgsg.py（v2 + 尺度轴 transformer）。
 
-  [A] 单变量机器校验：v4 相对 v2 的 config 差异只在 segformer_scale_xattn；
-      state_dict 新增键恰为 heads.*.scale_xattn.* 前缀；**共有键逐位相同**
-      （构造顺序保证：scale_xattn 在 gate_ev 之后构造 ⇒ 不平移共有权重 RNG 流）；
-      新参数全部 rest(满 LR) 组；无 pba_projs 键（PBA 确实被拆掉）。
-  [B] 初始严格等价：同 seed 下 v4 与 v2 eval logits 逐位一致（xattn 零 out_proj）。
-  [C] 接线有效：xattn out_proj 置非零 → logits 变。
-  [D] 梯度通路：置非零后 scale_xattn 全部参数有非零梯度。
+  [A] v4 与 v2 的 config 只差 segformer_scale_xattn；state_dict 新增键只在 heads.*.scale_xattn.*，
+      共有键逐位相同（scale_xattn 在 gate_ev 之后构造，不平移共有权重的 RNG 流）；
+      新参数不在 encoder 组；无 pba_projs 键；out_proj 零初始化。
+  [B] 同 seed 下 v4 与 v2 的 eval logits 逐位一致。
+  [C] out_proj 置非零后 logits 改变（已接线）。
+  [D] 置非零后 scale_xattn 全部参数有非零梯度。
+  [E] 无证据对照，见 _check_noevidence_controls。
 """
 import sys
 
@@ -20,6 +21,10 @@ from floe.models.sota.segformer import SegFormer
 
 V2_CFG = 'configs/FLOE/pgsg_evidence_gate.py'
 V4_CFG = 'configs/FLOE/pgsg.py'
+BASE_CFG = 'configs/FLOE/sota_segformer_in1k_dlr_417.py'
+# No-evidence controls (b') and (c'), each paired with its evidence twin.
+NOEV_PAIRS = [('configs/FLOE/pgsg_gate_noevidence.py', V2_CFG),
+              ('configs/FLOE/pgsg_noevidence.py', V4_CFG)]
 
 
 def _load_opts(p):
@@ -86,9 +91,45 @@ def main():
             assert p.grad is not None and p.grad.abs().max().item() > 0, \
                 f'{name} 梯度为零'
     print('[D] PASS：scale_xattn 全部参数有梯度', flush=True)
+
+    _check_noevidence_controls(x)
     print('\nALL PASS — PGSG-v4 结构自检通过。GPU 端到端门禁：\n'
           '  python -m tools.checks.smoke_pipeline configs/FLOE/pgsg.py',
           flush=True)
+
+
+def _check_noevidence_controls(x):
+    """[E] No-evidence controls: single-variable vs their evidence twins, no
+    evidence modules, shared weights with the baseline bit-identical, and t=0
+    logits bit-identical to the baseline."""
+    ob = _load_opts(BASE_CFG)
+    nb = _build(ob)
+    db = nb.state_dict()
+    nb.eval()
+    with torch.no_grad():
+        yb = nb(x)['FLOE']
+    for noev_cfg, ev_cfg in NOEV_PAIRS:
+        on, oe = _load_opts(noev_cfg), _load_opts(ev_cfg)
+        diff = {k for k in set(on) | set(oe)
+                if on.get(k, '<absent>') != oe.get(k, '<absent>')}
+        assert diff == {'segformer_gate_evidence'}, \
+            f'{noev_cfg} 非单变量差异：{sorted(diff)}'
+        assert on['segformer_gate_evidence'] is False
+        assert on.get('segformer_gate_mode') == 'softmax', 'gate_mode 必须显式为 softmax'
+        nn_ = _build(on)
+        sn = nn_.state_dict()
+        assert nn_.gate_ev_vario is None and nn_.gate_ev_pol is None, \
+            f'{noev_cfg} 不应构造证据模块'
+        assert not any('gate_ev_' in k for k in sn), f'{noev_cfg} 含证据键'
+        shared = set(db) & set(sn)
+        bad = [k for k in shared if not torch.equal(db[k], sn[k])]
+        assert not bad, f'{noev_cfg} 与 baseline 共有键数值不同：{bad[:5]}'
+        nn_.eval()
+        with torch.no_grad():
+            assert torch.equal(nn_(x)['FLOE'], yb), \
+                f'{noev_cfg} t=0 logits 与 baseline 不一致'
+        print(f'[E] PASS：{noev_cfg} 单变量 + 无证据模块 + 共有键与 baseline 逐位相同 + '
+              't=0 logits 等于 baseline', flush=True)
 
 
 if __name__ == '__main__':
