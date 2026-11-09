@@ -1,0 +1,10 @@
+# Main GPU queue for tools/system/run_queue.sh: READY | COMMAND ({GPU} = first idle GPU), strict order.
+# AutoICE first: its data is ready while the fold-0 copy is still being compressed.
+a4a   | bash tools/system/launch_run.sh a4a_baseline configs/AI4Arctic/a4a_baseline.py 42 {GPU}
+a4a   | bash tools/system/launch_run.sh a4a_pgsg configs/AI4Arctic/a4a_pgsg.py 42 {GPU}
+fold0 | bash tools/system/launch_fold.sh 0 42 baseline:{GPU}
+fold0 | bash tools/system/launch_fold.sh 0 42 pgsg:{GPU}
+fold0 | bash tools/system/launch_fold.sh 0 42 pgsg_noev:{GPU}
+fold0 | bash tools/system/launch_fold.sh 0 42 res160:{GPU}
+fold0 | bash tools/system/launch_fold.sh 0 42 res80:{GPU}
+fold0 | bash tools/system/launch_fold.sh 0 42 gate_noev:{GPU}
