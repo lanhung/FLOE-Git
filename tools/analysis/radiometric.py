@@ -1,51 +1,18 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""辐射域捷径探针：val 上做 SAR 辐射扰动，看 hard-ice 退化多少（2026-07-26，零训练成本）。
+"""辐射扰动探针：在已有 checkpoint 上扰动 val 的 SAR 辐射水平，看 hard-ice 退化多少（无需训练）。
 
-动机（docs/2026-07-26_M1_vario_texture.md §3）
---------------------------------------------
-M1 的假设 H1 是"模型的纹理表征被对比度/亮度混淆 ⇒ 跨景不迁移"。但 M1 只是**新增**一条
-不变通路、主路仍自由携带幅度 ⇒ **M1 平掉并不能否证 H1**（"模型压根没用这条新通路"同样
-解释得通）。本探针直接测 H1 本身，且**不需要训练任何东西**：
+z 空间（默认 VARIANTS 或 --variants）：有效像元内 HH/HV ← a·x + b（z-score 单位；b 为定标偏置，
+a 为对比度）。HH 与 HV 的 σ 不同（8.33 / 9.45 dB），b=0.30 ≈ +2.50 dB(HH) / +2.83 dB(HV)。
+dB 空间（--db-shifts，论文口径）：HH 与 HV 同加 d dB，x' = clip(z·σ+μ+d, −35, 5)，再按 μ/σ 归一化；
+μ/σ 取自 NC 属性 zscore_mean/zscore_std 并逐景核对（或 --zscore-stats）。
+两种模式都从扰动后的 HH/HV 重算 pol_ratio；入射角、GLCM、mask 不动，结果是捷径依赖的下界。
+推理走 fast_tiled_val_predict（对齐 tile + 门控 + 按需读）；--dump-cm 每个变体一个文件，格式同
+tools.evaluate --dump-cm。
 
-  在已有 checkpoint 上给 val 的 SAR 通道做辐射扰动 x → a·x + b，看 hard-ice 退化多少。
-    · 退化明显 ⇒ 模型确实吃了绝对辐射水平这个捷径（H1 成立）→ M1/M2/M3 这条线有靶子；
-    · 几乎不退化 ⇒ 捷径不存在 ⇒ H1 否掉、整条不变性线可关（省下后续所有 run）。
-
-口径与物理含义
---------------
-nersc SAR 通道是 dB 后再全局 z-score 的，所以在这个空间里：
-  · **加性偏置 b = 辐射定标/增益漂移**（线性功率乘 g ⇒ dB 加 10log10(g)）；
-  · **乘性增益 a = 对比度变化**（dB 动态范围被拉伸/压缩）。
-两者正是景与景之间真实存在的差异，也正是 `_VarioTexture` 的归一化剖面在特征域刻意
-不变的那两个自由度。b 的单位是 z-score，1 z-unit = 全数据集 dB 标准差（HH 典型 5~8 dB）
-⇒ **b=0.15 ≈ 1 dB、b=0.30 ≈ 2 dB**，都在真实景间差异的量级内。给 ±0.15/±0.30 两档是为了
-拿到**剂量-响应**曲线：单点退化可以是任何东西，单调的剂量-响应才是证据。
-
-扰动只作用在 ch0(HH)/ch1(HV) 与派生的 pol_ratio 上，且**只在 global_valid_mask==1 的
-像元内**（定标影响真实信号，不影响 nodata 填充；否则会在黑边造出人工结构）。
-⚠️ **入射角(ch2)、GLCM HH 纹理(ch3-5)、mask(ch6) 不动** ⇒ 本探针给出的是捷径依赖的
-**下界**（GLCM 是二阶量、几乎不携带绝对水平，但严格来说模型仍可从它读到一点残余信息）。
-
-推理路径与 quickstart 验证完全一致：`fast_tiled_val_predict`（原生分辨率、与 patch 网格
-对齐的不重叠 tile、tile 门控）+ **按需读**。本探针**不改 tile 网格**（与 offset-TTA 那类
-探针不同，没有网格错位），所以是 `val_ondemand_ok` 明确允许的用法。所有变体共用同一次
-场景解码，7 个变体只多 6 次前向。
-⚠️ 第一版用的是 `fast_tiled_val_inference`，实测 **2.5 分钟/景**（42 景 × 2 seed = 3.5 小时）
-—— 它要实体化 n_classes×H×W 的整景 logits（最大景 3.7GB）、把整景输入搬上 GPU 再搬回、
-且不门控，7 个变体把这些开销乘了 7 倍。闸门比它要守的 3 小时训练还贵，逻辑就颠倒了。
-换 `fast_tiled_val_predict` 后逐 batch 就地 argmax、整景留 CPU、跳过 66% 的 tile。
-指标从全局 float64 混淆矩阵导出，逐景 CM 按场景名排序 dump（与 evaluate_scenes --dump-cm
-同序，可喂 analyze_scene_cm.py 做**同 checkpoint 配对 bootstrap**——这个场景下配对
-bootstrap 有效，见 docs/2026-07-20 §5）。
-
-用法（服务器，GPU 空闲时）：
-  python -m tools.analysis.radiometric --self-test          # 先过扰动逻辑自检，不碰数据/GPU
-  python -m tools.analysis.radiometric \
-      --config configs/FLOE/sota_segformer_in1k_dlr_417.py \
-      --checkpoint work_dir/floe_b2_dlr_smsel_s42/best_model_floe_b2_dlr_smsel_s42.pth \
-      --val-list datalists/val_417.json \
-      --dump-cm /root/autodl-tmp/cm/radio/b2_smsel_s42.npz
+  python -m tools.analysis.radiometric --self-test
+  python -m tools.analysis.radiometric --config <cfg> --checkpoint <ckpt> \
+      --val-list datalists/cv5/fold0_val.json --db-shifts=-4,-2,-1,1,2,4 --dump-cm <out>.npz
 """
 import argparse
 import copy
@@ -64,10 +31,10 @@ from floe.functions import get_model, fast_tiled_val_predict
 
 # (标签, a 乘性增益=对比度, b 加性偏置=定标漂移[z-score 单位])
 VARIANTS = [
-    ('id',      1.00,  0.00),   # 恒等参照（也是确定性地板）
-    ('b+0.15',  1.00,  0.15),   # ≈ +1 dB 定标漂移
+    ('id',      1.00,  0.00),   # 恒等参照
+    ('b+0.15',  1.00,  0.15),   # ≈ +1.25 dB(HH) / +1.42 dB(HV)
     ('b-0.15',  1.00, -0.15),
-    ('b+0.30',  1.00,  0.30),   # ≈ +2 dB
+    ('b+0.30',  1.00,  0.30),   # ≈ +2.50 dB(HH) / +2.83 dB(HV)
     ('b-0.30',  1.00, -0.30),
     ('a0.90',   0.90,  0.00),   # 对比度 −10%
     ('a1.10',   1.10,  0.00),   # 对比度 +10%
@@ -81,20 +48,94 @@ def parse_args():
     p.add_argument('--val-list')
     p.add_argument('--dump-cm', default=None, help='逐景 CM 输出 .npz 前缀（每变体一个文件）')
     p.add_argument('--self-test', action='store_true', help='只跑扰动逻辑自检后退出')
-    # 2026-08-04（暗景因果验证）：允许覆盖扰动清单，格式 "tag:a:b,tag:a:b,..."，
-    # 如 "id:1:0,b-0.70:1:-0.70"。省略时用模块级 VARIANTS，历史行为逐位不变。
-    # 必须包含 id（Δ 的参照）。自检（--self-test）始终用完整 VARIANTS，不受本参数影响。
+    # 如 "id:1:0,b-0.70:1:-0.70"；省略时用 VARIANTS。--self-test 始终用完整 VARIANTS。
     p.add_argument('--variants', default=None,
                    help='覆盖扰动清单："tag:a:b" 逗号分隔；须含 id:1:0')
+    p.add_argument('--db-shifts', default=None,
+                   help='dB 空间共模偏移清单（dB），如 "-4,-2,2,4"；给出时替代 z 空间清单，'
+                        '自动加 id 参照')
+    p.add_argument('--zscore-stats', default=None,
+                   help='zscore_stats.json（全局 mean/std）；缺省时从各景 NC 变量属性 '
+                        'zscore_mean/zscore_std 读取（417 景归档每个文件都带）')
+    p.add_argument('--check-nc-attrs', action='store_true',
+                   help='给了 --zscore-stats 时，与首景 NC 属性对拍')
     return p.parse_args()
 
 
+DB_CLIP = (-35.0, 5.0)   # 归一化前的 dB 截断区间（DATASET_HANDBOOK §8）
+
+
+def load_zscore_stats(path, var_hh='nersc_sar_primary', var_hv='nersc_sar_secondary'):
+    """读 zscore_stats.json，返回 {'hh': (mean, std), 'hv': (mean, std)}。
+    兼容两种常见结构：{var: {mean, std}} 与 {'mean': {var: ..}, 'std': {var: ..}}。"""
+    d = json.load(open(path))
+
+    def get(var):
+        if var in d and isinstance(d[var], dict):
+            e = d[var]
+            return float(e.get('mean', e.get('zscore_mean'))), float(e.get('std', e.get('zscore_std')))
+        if 'mean' in d and 'std' in d:
+            return float(d['mean'][var]), float(d['std'][var])
+        raise KeyError(f'{path}: 找不到 {var} 的 mean/std，结构未知：{list(d)[:8]}')
+    return {'hh': get(var_hh), 'hv': get(var_hv)}
+
+
+def nc_zscore_stats(nc_path, var_hh='nersc_sar_primary', var_hv='nersc_sar_secondary'):
+    """从 NC 变量属性读 {'hh': (mean, std), 'hv': (mean, std)}。"""
+    import h5py
+    out = {}
+    with h5py.File(nc_path, 'r') as h:
+        for key, var in (('hh', var_hh), ('hv', var_hv)):
+            a = h[var].attrs
+            if 'zscore_mean' not in a or 'zscore_std' not in a:
+                raise KeyError(f'{nc_path}:{var} 无 zscore_mean/zscore_std 属性')
+            out[key] = (float(np.asarray(a['zscore_mean']).reshape(-1)[0]),
+                        float(np.asarray(a['zscore_std']).reshape(-1)[0]))
+    return out
+
+
+def check_stats_against_nc(stats, nc_path, var_hh='nersc_sar_primary',
+                           var_hv='nersc_sar_secondary', rtol=1e-4):
+    nc = nc_zscore_stats(nc_path, var_hh, var_hv)
+    for key, var in (('hh', var_hh), ('hv', var_hv)):
+        m, sd = nc[key]
+        if not (np.isclose(m, stats[key][0], rtol=rtol) and np.isclose(sd, stats[key][1], rtol=rtol)):
+            raise ValueError(f'统计量不一致 {var}: json=({stats[key][0]}, {stats[key][1]}) '
+                             f'nc=({m}, {sd})')
+
+
+def parse_db_shifts(spec):
+    out = [('id', 1.0, 0.0)]
+    for item in spec.split(','):
+        d = float(item)
+        if d == 0:
+            continue
+        out.append(('dB%+.1f' % d, 'db', d))
+    return out
+
+
+def apply_db_shift(x, hh0, hv0, valid, d, stats, pol_idx):
+    """有效像元内：HH/HV 同加 d dB（先反归一化、再按 [-35,5] dB 截断、再归一化），
+    并从扰动后的两通道重算 pol_ratio。返回 (HH 截断比例, HV 截断比例)。"""
+    lo, hi = DB_CLIP
+    clip_frac = []
+    for ch, orig, key in ((0, hh0, 'hh'), (1, hv0, 'hv')):
+        mu, sd = stats[key]
+        db = orig * sd + mu + d
+        clipped = ((db < lo) | (db > hi)) & valid
+        n_valid = max(int(valid.sum()), 1)
+        clip_frac.append(float(clipped.sum()) / n_valid)
+        z = (db.clamp(lo, hi) - mu) / sd
+        x[:, ch:ch + 1] = torch.where(valid, z.to(x.dtype), orig)
+    if pol_idx is not None:
+        x[:, pol_idx:pol_idx + 1] = x[:, 0:1] - x[:, 1:2]
+    return tuple(clip_frac)
+
+
 def parse_variants(spec):
-    """除 "tag:a:b" 固定仿射外，认两个逐景自适应特殊 tag（a/b 占位填 0，运行时按
-    该景 valid 区统计现算）：
-      center —— 逐景居中：b_ch = −mean_valid(ch)，a=1（每景每通道一个常数）
-      zscene —— 逐景标准化：a_ch = 1/std_valid(ch)，b_ch = −mean/std
-    这是 0b「辐射对齐家族上界」探针（docs/2026-08-04_M2_radaug.md §1）的载体。"""
+    """解析 "tag:a:b,..."。另认两个逐景自适应 tag（a/b 填 0，运行时按该景 valid 区统计现算）：
+      center: 逐景居中，b_ch = −mean_valid(ch)，a=1
+      zscene: 逐景标准化，a_ch = 1/std_valid(ch)，b_ch = −mean/std"""
     out = []
     for item in spec.split(','):
         tag, a, b = item.split(':')
@@ -123,15 +164,10 @@ def channel_layout(opts):
 
 
 def apply_radiometric(x, hh0, hv0, valid, a, b, pol_idx, a2=None, b2=None):
-    """就地把 x 的 SAR 通道置为 a·orig + b（仅 valid 处），并同步重算 pol_ratio。
+    """就地把 x 的 HH/HV 置为 a·orig + b（仅 valid 处），并从扰动后的两通道重算 pol_ratio。
 
-    hh0/hv0 是**原始**通道的备份 ⇒ 每个变体都从原始出发，不会跨变体累积浮点漂移。
-    pol_ratio = HH − HV，扰动后为 a·(HH−HV)（偏置 b 在差分里精确消掉），从扰动后的
-    两个通道重算即自动一致；无效区两个通道都没动 ⇒ pol_ratio 也保持原值。
-
-    a2/b2（2026-08-04 加，0b 逐景对齐探针用）：HV 通道的独立系数；None 时与 HH
-    共用——所有历史调用不传 ⇒ 行为逐位不变。逐通道时 pol_ratio 不再精确消 b，
-    仍从扰动后的两通道重算，保持自洽。
+    hh0/hv0 是原始通道的备份，每个变体都从原始出发，不跨变体累积浮点误差。
+    a2/b2 是 HV 的独立系数，None 时与 HH 共用。
     """
     a2 = a if a2 is None else a2
     b2 = b if b2 is None else b2
@@ -174,24 +210,42 @@ def self_test():
     print('[self-test] PASS 扰动逻辑：有效区精确仿射、无效区与其余通道逐位不动、'
           'pol_ratio 自洽、变体间无浮点漂移、id 可还原', flush=True)
 
+    # dB 模式：已知统计量下的精确换算 + 截断 + pol 重算 + 无效区不动
+    stats = {'hh': (-13.9018, 8.3349), 'hv': (-27.0105, 9.4454)}
+    x = x_orig.clone()
+    hh_db = x_orig[:, 0:1] * 8.3349 - 13.9018
+    hv_db = x_orig[:, 1:2] * 9.4454 - 27.0105
+    for d in (2.0, -4.0, 0.0):
+        apply_db_shift(x, hh0, hv0, valid, d, stats, 7)
+        v = valid.squeeze(1)
+        exp_hh = ((hh_db + d).clamp(*DB_CLIP) + 13.9018) / 8.3349
+        exp_hv = ((hv_db + d).clamp(*DB_CLIP) + 27.0105) / 9.4454
+        assert torch.allclose(x[:, 0][v], exp_hh[:, 0][v], atol=1e-5), d
+        assert torch.allclose(x[:, 1][v], exp_hv[:, 0][v], atol=1e-5), d
+        assert torch.equal(x[:, 0][~v], x_orig[:, 0][~v]), d
+        assert torch.allclose(x[:, 7], x[:, 0] - x[:, 1], atol=1e-6), d
+        for c in (2, 3, 4, 5, 6):
+            assert torch.equal(x[:, c], x_orig[:, c]), f'dB{d} ch{c} 被改动了'
+    print('[self-test] PASS dB 模式：反归一化-偏移-截断-归一化精确、pol 重算、其余通道不动',
+          flush=True)
+
 
 def infer_pred(x, net, opts, labels, valid_maps):
-    """一次完整场景推理，返回 (H,W) uint8 CPU 预测图。
+    """一次整景推理，返回 (H,W) uint8 CPU 预测图（与训练验证同一条 fast_tiled_val_predict 路径）。
 
-    走 quickstart 验证同一条路径 `fast_tiled_val_predict`：整景留在 CPU（只有每批 tile
-    上 GPU）、逐 batch 就地 argmax（不开整景 logits 缓冲）、tile 门控跳过标签全 255 的
-    tile。被跳过的 tile 预测为 0，但它们的像素在打分时一律被 valid_maps 排除 ⇒ 不影响
-    任何指标（本探针只算混淆矩阵，不做可视化，满足这个前提）。"""
+    被门控跳过的 tile 预测为 0，但这些像素打分时被 valid_maps 排除，不影响混淆矩阵。"""
     with torch.no_grad(), torch.cuda.amp.autocast():
         preds, _ = fast_tiled_val_predict(x, net, opts, labels=labels,
                                           valid_maps=valid_maps, gate=True)
     return preds['FLOE']
 
 
-def cm_iou(cm):
+def cm_iou(cm, absent=0.0):
+    """absent：GT 与预测都不含该类时的 IoU 取值。全局汇总用 0（与论文表一致，缺失会告警），
+    逐景用 NaN。"""
     inter = np.diag(cm)
     union = cm.sum(0) + cm.sum(1) - inter
-    return np.where(union > 0, inter / np.maximum(union, 1), 0.0)
+    return np.where(union > 0, inter / np.maximum(union, 1), absent)
 
 
 def main():
@@ -211,9 +265,25 @@ def main():
         'swin/PA2 走重叠滑窗（batched_slide_inference），与本探针的对齐 tile 路径 + 按需读' \
         '不兼容 —— 拒绝运行，免得静默读到 0'
     n_cls = opts['n_classes']['FLOE']
-    variants = parse_variants(args.variants) if args.variants else VARIANTS
-    if args.variants:
-        print(f'[variants] 使用覆盖清单：{variants}', flush=True)
+    db_stats = None
+    if args.db_shifts:
+        assert not args.variants, '--db-shifts 与 --variants 互斥'
+        if args.zscore_stats:
+            db_stats = load_zscore_stats(args.zscore_stats)
+        else:
+            _first = json.load(open(args.val_list))[0]
+            db_stats = nc_zscore_stats(osp.join(opts['path_to_train_data'], _first))
+            print(f'[dB] 统计量取自 {_first} 的 NC 属性（每景还会逐一核对）', flush=True)
+        variants = parse_db_shifts(args.db_shifts)
+        (mh, sh), (mv, sv) = db_stats['hh'], db_stats['hv']
+        print(f'[dB] stats HH μ={mh:.4f} σ={sh:.4f} dB | HV μ={mv:.4f} σ={sv:.4f} dB；'
+              f'1 dB = {1/sh:.4f} z(HH) / {1/sv:.4f} z(HV)；'
+              f'pol 通道每 dB 变化 {1/sh - 1/sv:+.4f}', flush=True)
+        print(f'[variants] dB 清单：{variants}', flush=True)
+    else:
+        variants = parse_variants(args.variants) if args.variants else VARIANTS
+        if args.variants:
+            print(f'[variants] 使用覆盖清单：{variants}', flush=True)
     hh_i, hv_i, mask_i, pol_i, n_ch = channel_layout(opts)
     print(f'[layout] n_ch={n_ch} | HH=ch{hh_i} HV=ch{hv_i} mask=ch{mask_i} '
           f'pol_ratio={"ch%d" % pol_i if pol_i is not None else "无"}；'
@@ -225,15 +295,15 @@ def main():
         sd = {k.replace('_orig_mod.', '', 1): v for k, v in sd.items()}
     net.load_state_dict(sd)
     net.eval()
-    # 模型已按【完整 charts】建好并 strict load（多任务 checkpoint 含辅头）；此后的
-    # 数据读取 / 前向 / 指标一律只跑 target chart（辅任务 train-only）——否则 val 景可能
-    # 根本没有辅任务变量（KeyError），且 tile 门控会因"辅任务处处有效"而全失效。
-    # 无 aux_charts 时返回的就是 opts 本身，行为不变。
+    # 模型按完整 charts 建好并 strict load（多任务 checkpoint 含辅头）；此后读取、前向与指标
+    # 只跑 target chart：val 景可能没有辅任务变量，且辅任务处处有效会让 tile 门控失效。
     opts = val_scoped_options(opts)
 
     files = json.load(open(args.val_list))
-    # 按需读：本探针不改 tile 网格、且只在门控后的对齐 tile 上前向 ⇒ 满足 val_ondemand_ok
-    # 的前提。不满足时（或 config 关了 kill switch）自动退回整景读并打印原因。
+    if db_stats is not None and args.check_nc_attrs:
+        check_stats_against_nc(db_stats, osp.join(opts['path_to_train_data'], files[0]))
+    # 本探针不改 tile 网格、只在门控后的对齐 tile 上前向，满足按需读的前提；
+    # 不满足时（或 config 关闭）退回整景读并打印原因。
     ok, why = val_ondemand_ok(opts, 1)
     ondemand = bool(opts.get('val_ondemand_read', True)) and ok
     print(f'[ondemand] {"启用" if ondemand else "退回整景读"}：{why}', flush=True)
@@ -255,9 +325,12 @@ def main():
         gt = np.squeeze(np.asarray(inf_y['FLOE'])).astype(np.int64)
         m = gt != 255
 
+        if db_stats is not None and not args.zscore_stats:
+            # 归一化必须是全局的：逐景核对属性，任何一景不同即中止（否则 dB 换算失真）
+            check_stats_against_nc(db_stats, osp.join(opts['path_to_train_data'], str(name)))
         valid = x[:, mask_i:mask_i + 1] > 0.5
         hh0, hv0 = x[:, hh_i:hh_i + 1].clone(), x[:, hv_i:hv_i + 1].clone()
-        # 门控/打分掩膜与 quickstart 一致：valid = ~cfv_masks（loader 已算好，别重算）
+        # 门控/打分掩膜同训练验证：valid = ~cfv_masks
         valid_maps = {c: ~cfv_masks[c] for c in opts['charts']}
         line = []
         for tag, a, b in variants:
@@ -273,6 +346,10 @@ def main():
                     apply_radiometric(x, hh0, hv0, valid,
                                       1.0 / s_hh, -m_hh / s_hh, pol_i,
                                       a2=1.0 / s_hv, b2=-m_hv / s_hv)
+            elif a == 'db':
+                fh, fv = apply_db_shift(x, hh0, hv0, valid, b, db_stats, pol_i)
+                if max(fh, fv) > 0.01:
+                    line.append('[clip %s HH%.1f%% HV%.1f%%]' % (tag, 100 * fh, 100 * fv))
             else:
                 apply_radiometric(x, hh0, hv0, valid, a, b, pol_i)
             pred = infer_pred(x, net, opts, inf_y, valid_maps).numpy().astype(np.int64)
@@ -280,17 +357,23 @@ def main():
                              ).reshape(n_cls, n_cls).astype(np.float64)
             global_cm[tag] += cm
             scene_cms[tag].append(cm)
-            iou = cm_iou(cm)
-            line.append('%s=%.3f' % (tag, np.mean([iou[2], iou[3]]) if m.any() else float('nan')))
+            iou = cm_iou(cm, absent=np.nan)
+            # 景内不存在（GT 与预测均无）的类记 NaN，否则逐景 hard-ice 只是在数该景有几类。
+            hi_ = [iou[2], iou[3]]
+            line.append('%s=%s' % (tag, '%.3f' % np.nanmean(hi_) if not np.all(np.isnan(hi_)) else 'nan'))
             torch.cuda.empty_cache()
         del hh0, hv0, valid, x
         scene_ids.append(sid)
         print('%-44s hard-ice %s  (%dx%d)' % (sid[:44], ' '.join(line), H, W), flush=True)
 
-    # ---- 汇总 ----
+    # 汇总
     order = np.argsort(scene_ids)
     sorted_ids = np.array(scene_ids)[order]
     base_iou = cm_iou(global_cm['id'])
+    _support = global_cm['id'].sum(1)
+    if (_support == 0).any():
+        print(f'[WARN] 评估集中无 GT 像元的类：{np.where(_support == 0)[0].tolist()}；'
+              f'其 IoU 记 0 并计入 macro', flush=True)
     base_hard = float(np.mean([base_iou[2], base_iou[3]]))
     print('\n' + '=' * 96, flush=True)
     print('%-9s %8s %8s %9s | %s' % ('variant', 'macro', 'hard-ice', 'Δhard',

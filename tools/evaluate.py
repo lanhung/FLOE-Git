@@ -1,38 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Per-scene evaluation script. Supports single-model and multi-model ensemble inference.
+r"""
+Per-scene and global evaluation of one model or a logit-averaged ensemble.
 
-When multiple --config / --checkpoint pairs are provided the logits from all models
-are averaged before class decoding (logit-level ensemble).
+    python -m tools.evaluate --config CFG [CFG ...] --checkpoint CKPT [CKPT ...] \
+        --val-list datalists/cv5/fold0_val.json [--dump-cm OUT.npz]
 
-Usage:
-    # Single model
-    python -m tools.evaluate \
-        --config configs/SOD/smp_fpn_mit_b2.py \
-        --checkpoint work_dirs/fold0/best_model.pth \
-        --val-list datalists/cv_folds6/fold0_val.json
-
-    # Multi-model ensemble
-    python -m tools.evaluate \
-        --config configs/SOD/model_a.py configs/SOD/model_b.py \
-        --checkpoint work_dirs/fold0/best_a.pth work_dirs/fold1/best_b.pth \
-        --val-list datalists/cv_folds6/fold0_val.json \
-        --output-dir eval_results/ensemble
-
-All models must share the same charts and n_classes.
-Dataset settings (val_path, variable options, etc.) are taken from the first config.
+All models must share charts and n_classes; dataset settings come from the first config.
+--dump-cm writes per-scene confusion matrices (read by tools.analysis.paired_cv / scene_cm).
 """
 
 import argparse
 import copy
 import json
-import os
+import math
 import os.path as osp
 import pathlib
-import sys
 import warnings
-from collections import defaultdict
 
 import numpy as np
 import torch
@@ -57,7 +41,6 @@ from floe.functions import (
     compute_overall_accuracy,
     fast_tiled_val_inference,
     get_model,
-    slide_inference,
 )
 from floe.loaders import (AI4ArcticChallengeTestDataset, get_variable_options, val_scoped_options,
                      limit_torch_threads, val_ondemand_ok)
@@ -85,7 +68,7 @@ def parse_args():
     parser.add_argument('--dump-cm', type=pathlib.Path, default=None,
                         help='把每个场景的混淆矩阵存成 .npz（scenes:(S,) str, cm:(S,C,C) float64，'
                              '按 target_chart）。全局 CM = cm.sum(0)，与本脚本打印的全局指标同源。'
-                             '供 analyze_scene_cm.py 做合并类 IoU 与按景 bootstrap。')
+                             '供 tools.analysis.scene_cm / paired_cv 使用。')
     return parser.parse_args()
 
 
@@ -103,9 +86,8 @@ def load_checkpoint(net, checkpoint_path, device):
 def build_val_loader(train_options, val_list_path, n_models=1):
     """Build a DataLoader for the validation set.
 
-    按需读是显式 opt-in 的（见 loaders.val_ondemand_ok）：集成推理（n_models > 1）下
-    `need` 网格只按第一个模型的 patch_size 算，其余模型会切到未解码的区域，所以必须关。
-    prefetch_factor 钉成 1 —— 一个样本就是一整景，默认的 2 会让在飞景数翻倍。
+    按需读（见 loaders.val_ondemand_ok）在集成推理下必须关：需读网格只按第一个模型的
+    patch_size 计算。prefetch_factor=1，因为一个样本就是一整景。
     """
     val_files = json.loads(open(str(val_list_path)).read())
     od_ok, od_why = val_ondemand_ok(train_options, n_models=n_models)
@@ -214,8 +196,7 @@ def _update_confusion_matrix(cm_accum, pred, true, num_classes):
     p = pred[valid].view(-1)
     idx = t * num_classes + p
     binc = torch.bincount(idx, minlength=num_classes * num_classes)
-    # float64：与昨天 quickstart 验证一致。原生分辨率下全局混淆矩阵单元可达数亿，float32
-    # 尾数只有 24 bit（精确整数上限 2^24≈1.67e7），累加会掉精度、令 mIoU 在末位漂移。
+    # float64：原生分辨率下混淆矩阵单元可达数亿，超过 float32 的精确整数上限 2^24。
     cm_accum += binc.view(num_classes, num_classes).double()
     return cm_accum
 
@@ -237,9 +218,8 @@ def derive_metrics_from_cm(global_cm, train_options):
         true_sum = cm.sum(dim=1)
         total = cm.sum().clamp(min=1.0)
 
-        # Per-class IoU
+        # Per-class IoU and mIoU (absent classes count as 0)
         iou_per_class = tp / (pred_sum + true_sum - tp).clamp(min=1e-8)
-        # mIoU
         results.setdefault('miou', {})[chart] = iou_per_class.mean().item()
         results.setdefault('iou_per_class', {})[chart] = iou_per_class.tolist()
 
@@ -298,53 +278,6 @@ def derive_metrics_from_cm(global_cm, train_options):
         combined += results['f1_weighted'][chart] * w
         sum_w += w
     results['combined_score'] = round(combined / max(sum_w, 1e-8), 3)
-
-    return results
-
-
-def aggregate_global_metrics(outputs_flat, inf_ys_flat, train_options):
-    """Compute aggregated metrics across all scenes (legacy, use derive_metrics_from_cm instead)."""
-    charts = train_options['charts']
-    n_classes = train_options['n_classes']
-
-    results = {}
-
-    miou = compute_mIoU(inf_ys_flat, outputs_flat, charts, n_classes)
-    results['miou'] = {c: miou[c].item() for c in charts}
-
-    classwise_iou = compute_classwise_IoU(inf_ys_flat, outputs_flat, charts, n_classes)
-    results['iou_per_class'] = {c: [v.item() for v in classwise_iou[c]] for c in charts}
-
-    combined_score, scores = compute_metrics(
-        inf_ys_flat, outputs_flat, charts,
-        train_options['chart_metric'], n_classes)
-    results['f1_weighted'] = {c: scores[c].item() for c in charts}
-    results['combined_score'] = combined_score.item()
-
-    classwise_f1 = compute_classwise_f1score(inf_ys_flat, outputs_flat, charts, n_classes)
-    results['f1_per_class'] = {c: [v.item() for v in classwise_f1[c]] for c in charts}
-
-    oa = compute_overall_accuracy(inf_ys_flat, outputs_flat, charts)
-    results['oa'] = {c: oa[c] for c in charts}
-
-    prec, rec = compute_classwise_precision_recall(inf_ys_flat, outputs_flat, charts, n_classes)
-    results['precision_per_class'] = {c: [v.item() for v in prec[c]] for c in charts}
-    results['recall_per_class'] = {c: [v.item() for v in rec[c]] for c in charts}
-
-    cm_norm = compute_normalized_confusion_matrix(inf_ys_flat, outputs_flat, charts, n_classes)
-    results['confmat_norm'] = {c: cm_norm[c].cpu().numpy().tolist() for c in charts}
-
-    true_props, pred_props = compute_class_proportions(inf_ys_flat, outputs_flat, charts, n_classes)
-    results['true_proportions'] = {c: [v.item() for v in true_props[c]] for c in charts}
-    results['pred_proportions'] = {c: [v.item() for v in pred_props[c]] for c in charts}
-
-    ordinal_cfg = train_options.get('ordinal_metric', {})
-    if ordinal_cfg.get('enabled', False):
-        raw_costs, norm_scores = compute_ordinal_cost_metric(
-            inf_ys_flat, outputs_flat, charts, n_classes,
-            cost_per_distance=ordinal_cfg.get('cost_per_distance', None))
-        results['ordinal_mean_cost'] = {c: raw_costs[c].item() for c in charts}
-        results['ordinal_score'] = {c: norm_scores[c].item() for c in charts}
 
     return results
 
@@ -438,11 +371,11 @@ def print_global_result(result, train_options):
 
 
 def _infer_single(inf_x, net, train_options, valid_tile_mask=None):
-    """Run inference with one model, choosing the correct strategy from its train_options.
+    """Run inference with one model, choosing the strategy from its train_options.
 
-    valid_tile_mask：tile 门控（见 functions.compute_valid_tile_mask）。标签全为 ignore
-    的 tile 不前向，其 logits 保持 0；这些像素在打分时被 `~cfv_masks` 全部排除，指标
-    逐位不变。仅对 fast_tiled 路径生效。
+    valid_tile_mask (functions.compute_valid_tile_mask): tiles whose labels are all ignore
+    are not run and keep zero logits; those pixels are excluded from scoring anyway.
+    Only used on the fast_tiled path.
     """
     if train_options['model_selection'] in ('swin', 'PA2'):
         return batched_slide_inference(inf_x, net, train_options, 'val')
@@ -455,14 +388,11 @@ def _infer_single(inf_x, net, train_options, valid_tile_mask=None):
 
 
 def main():
-    # 容器里 nproc 报宿主机 208 核、cgroup 只给 25 核，torch 默认按 208 建 intraop 线程池，
-    # 超订会让 CPU 侧算子慢几百倍（见 loaders.limit_torch_threads / CLAUDE.md）。任何入口
-    # 脚本都必须在最前面调一次。
+    # 必须在任何 torch CPU 算子之前调用，避免容器内线程池超订（见 loaders.limit_torch_threads）。
     limit_torch_threads()
 
     args = parse_args()
 
-    # --- Validate paired config / checkpoint counts ---
     if len(args.config) != len(args.checkpoint):
         raise ValueError(
             f'--config and --checkpoint must have the same number of arguments '
@@ -470,7 +400,6 @@ def main():
 
     n_models = len(args.config)
 
-    # --- 1. Device ---
     if torch.cuda.is_available():
         device = torch.device(f'cuda:{args.gpu_id}')
         print(f'Using GPU: cuda:{args.gpu_id}')
@@ -478,7 +407,6 @@ def main():
         device = torch.device('cpu')
         print('GPU not available, using CPU.')
 
-    # --- 2. Load all configs and build all models ---
     all_train_options = []
     nets = []
     for i, (config_path, ckpt_path) in enumerate(zip(args.config, args.checkpoint)):
@@ -486,20 +414,17 @@ def main():
         cfg_i = Config.fromfile(str(config_path))
         opts_i = copy.deepcopy(cfg_i.train_options)
         opts_i = get_variable_options(opts_i)
-        # 模型必须用【完整 charts】建（多任务 checkpoint 含辅任务头，strict load 需要它）；
+        # 模型用完整 charts 建（多任务 checkpoint 含辅任务头，strict load 需要它），
+        # 之后的数据/推理/指标只跑 target chart（见 loaders.val_scoped_options）。
         net_i = get_model(opts_i, device)
         net_i = load_checkpoint(net_i, ckpt_path, device)
         net_i.eval()
-        # 之后的数据/推理/指标一律只跑 target chart（辅任务 train-only，见
-        # loaders.val_scoped_options）。无 aux_charts 时返回的就是 opts_i 本身。
         all_train_options.append(val_scoped_options(opts_i))
         nets.append(net_i)
 
-    # Dataset settings come from the first config
     train_options = all_train_options[0]
     train_options['val_path'] = str(args.val_list)
 
-    # Sanity-check that all models agree on charts and n_classes
     for i, opts_i in enumerate(all_train_options[1:], start=2):
         if opts_i['charts'] != train_options['charts']:
             raise ValueError(f'Model {i} charts {opts_i["charts"]} != model 1 charts {train_options["charts"]}')
@@ -511,11 +436,9 @@ def main():
     else:
         print(f'\nEnsemble of {n_models} models (logit-level averaging).')
 
-    # --- 3. Build validation loader ---
     dataloader, val_files = build_val_loader(train_options, args.val_list, n_models=n_models)
     print(f'Validation scenes: {len(val_files)}')
 
-    # --- 4. Setup output ---
     if args.no_save:
         output_dir = None
     elif args.output_dir is not None:
@@ -527,7 +450,6 @@ def main():
         mkdir_or_exist(output_dir)
         print(f'Results will be saved to: {output_dir}')
 
-    # --- 5. Per-scene evaluation ---
     per_scene_results = {}
     per_scene_cm = {}          # chart -> {scene_id: (C, C) ndarray}，仅 --dump-cm 时填充
     global_cm = {
@@ -543,8 +465,7 @@ def main():
         scene_id = osp.splitext(scene_name)[0]
         torch.cuda.empty_cache()
 
-        # tile 门控掩膜：标签全为 ignore 的 tile 不必前向（val_417 上占 66.1%）。
-        # 任一 chart 有有效像元就得算这个 tile。
+        # tile 门控：标签全为 ignore 的 tile 不前向；任一 chart 有有效像元就要算。
         tile_gate = None
         if cfv_masks is not None:
             for chart in train_options['charts']:
@@ -552,7 +473,7 @@ def main():
                 tile_gate = m if tile_gate is None else (tile_gate | m)
 
         # 单模型 + 原生分辨率 + 大景走流式路径：整景不上 GPU、不开整景 logits 缓冲。
-        # 集成（logit 平均）与降采样口径仍走原来的 logits 路径，只是加了同一个门控。
+        # 集成（logit 平均）与降采样仍走 logits 路径，同样使用门控。
         use_fast = (n_models == 1
                     and cfv_masks is not None
                     and train_options['down_sample_scale'] == 1
@@ -571,7 +492,6 @@ def main():
                                 for c in train_options['charts']}
             else:
                 inf_x = inf_x.to(device, non_blocking=True)
-                # Run all models and average their logits per chart
                 all_model_outputs = [_infer_single(inf_x, net_i, opts_i, tile_gate)
                                       for net_i, opts_i in zip(nets, all_train_options)]
                 output = {
@@ -579,12 +499,11 @@ def main():
                     for chart in train_options['charts']
                 }
 
-                # Decode predicted class maps
                 output_class = {}
                 for chart in train_options['charts']:
                     output_class[chart] = class_decider(output[chart], train_options, chart).detach()
 
-            # Upsample masks to original resolution (matching test_upload_function.py)
+            # Upsample masks to the original resolution.
             tfv_mask = torch.nn.functional.interpolate(
                 tfv_mask.type(torch.uint8).unsqueeze(0).unsqueeze(0),
                 size=original_size, mode='nearest').squeeze().squeeze().to(torch.bool)
@@ -617,14 +536,12 @@ def main():
                             y_t, size=original_size, mode='nearest').squeeze()
                         inf_y[chart] = y_t.cpu().numpy()
 
-            # --- Compute scene-level metrics ---
             scene_result = compute_scene_metrics(output_class, inf_y, cfv_masks, train_options)
             per_scene_results[scene_id] = scene_result
             print_scene_result(scene_id, scene_result, train_options)
 
-            # --- Incrementally update global confusion matrix ---
-            # 先算本景的 CM，再累加进全局。计数都是 < 2^53 的整数，float64 加法精确，
-            # 所以拆成 per-scene 再求和与原来的直接累加逐位相同。
+            # 先算本景的 CM 再累加进全局。计数都是 < 2^53 的整数，float64 加法精确，
+            # 所以 per-scene CM 之和与全局 CM 逐位相同。
             for chart in train_options['charts']:
                 pred_1d = output_class[chart].flatten()
                 true_1d = _ensure_tensor(inf_y[chart]).flatten().long()
@@ -639,17 +556,18 @@ def main():
                 if args.dump_cm is not None:
                     per_scene_cm.setdefault(chart, {})[scene_id] = scene_cm.cpu().numpy()
 
-    # --- 7. Global aggregation (derived from confusion matrices, no large tensors) ---
     print('\nComputing global metrics...')
     global_result = derive_metrics_from_cm(global_cm, train_options)
     print_global_result(global_result, train_options)
 
-    # --- 8. Summary table ---
     target_chart = train_options.get('target_chart', train_options['charts'][0])
     print(f"\n{'='*100}")
     print(f"  PER-SCENE SUMMARY")
     print(f"{'='*100}")
-    header = f"  {'Scene':<45s} {'mIoU':>8s} {'F1(w)':>8s} {'OA':>8s}"
+    # mIoU*: mean IoU over classes present in this scene's GT or prediction.
+    # The plain per-scene mIoU counts absent classes as 0 and so mostly reflects how many
+    # classes a scene contains; use mIoU* (or scene_cm.py --drop-empty) to rank scenes.
+    header = f"  {'Scene':<45s} {'mIoU':>8s} {'mIoU*':>8s} {'F1(w)':>8s} {'OA':>8s}"
     print(header)
     print("  " + "-" * len(header))
     for scene_id in sorted(per_scene_results.keys()):
@@ -658,12 +576,17 @@ def main():
         miou_v = r['miou'][target_chart]
         f1_v   = r['f1_weighted'][target_chart]
         oa_v   = r['oa'][target_chart]
-        import math
         if any(isinstance(v, float) and math.isnan(v) for v in [miou_v, f1_v, oa_v]):
-            print(f"  {short_name:<45s}      N/A      N/A      N/A  [no valid pixels]")
+            print(f"  {short_name:<45s}      N/A      N/A      N/A      N/A  [no valid pixels]")
         else:
+            _iou = r['iou_per_class'][target_chart]
+            _pres = [t > 0 or q > 0 for t, q in zip(r['true_proportions'][target_chart],
+                                                     r['pred_proportions'][target_chart])]
+            _ip = [v for v, ok in zip(_iou, _pres) if ok]
+            miou_p = sum(_ip) / len(_ip) if _ip else float('nan')
             print(f"  {short_name:<45s} "
                   f"{miou_v:8.4f} "
+                  f"{miou_p:8.4f} "
                   f"{f1_v:8.4f} "
                   f"{oa_v:8.4f}")
 
@@ -671,10 +594,10 @@ def main():
     print("  " + "-" * len(header))
     print(f"  {'<<< GLOBAL (all scenes) >>>':<45s} "
           f"{g['miou'][target_chart]:8.4f} "
+          f"{'':>8s} "
           f"{g['f1_weighted'][target_chart]:8.4f} "
           f"{g['oa'][target_chart]:8.4f}")
 
-    # --- 8b. Dump per-scene confusion matrices ---
     if args.dump_cm is not None and per_scene_cm.get(target_chart):
         scenes = sorted(per_scene_cm[target_chart].keys())
         cm_stack = np.stack([per_scene_cm[target_chart][s] for s in scenes], axis=0)
@@ -688,7 +611,7 @@ def main():
             config=np.array(str(args.config[0])),
             checkpoint=np.array(str(args.checkpoint[0])),
         )
-        # 自检：per-scene 之和必须与脚本打印的全局 mIoU 一致（float64 整数加法，应逐位相同）
+        # 自检：per-scene CM 之和给出的 mIoU 应与上面的全局 mIoU 逐位相同。
         cm_sum = torch.from_numpy(cm_stack.sum(axis=0))
         tp = torch.diag(cm_sum)
         iou = tp / (cm_sum.sum(0) + cm_sum.sum(1) - tp).clamp(min=1e-8)
@@ -697,7 +620,6 @@ def main():
         print(f'  self-check: mIoU from summed per-scene CM = {iou.mean().item():.6f}  '
               f'(global above = {global_result["miou"][target_chart]:.6f})')
 
-    # --- 9. Save ---
     if output_dir:
         def _to_native(obj):
             if isinstance(obj, dict):

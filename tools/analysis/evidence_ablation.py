@@ -1,29 +1,17 @@
-"""0-2：推理期证据消融——训练好的 PGSG 到底还在用证据吗？**需要 GPU**。
+"""推理期证据消融：训练好的 PGSG 推理时还依赖证据吗？需要 GPU。
 
-动机
-----
-Fig. 6 的读数显示"证据/特征激活贡献比"随训练衰减（(b) 0.445→0.098、(c) 0.394→0.045）。
-但那是 **conv1 输出的激活 RMS 之比**，是个幅度指标，不能直接读成"证据没用了"——
-也可能证据幅度小但携带关键信息。本脚本用**功能性**的方式回答：把证据换掉，指标掉不掉。
+Fig. 6 的证据/特征贡献比是激活幅度之比，不能直接读成"证据没用了"；这里把证据换掉，看指标掉不掉。
+  1. 默认用逐通道均值替换（--sub mean）而不是置零：门控 conv1 后接 BN，置零会平移其输出分布，
+     分不清是信息没了还是分布错位；均值只去掉空间/结构信息、保留量级。
+  2. 证据有两个消费者（尺度轴 transformer 的证据 token、门控输入），分别与同时替换。
+  3. 证据 = cat([vario 64ch, pol 32ch])，两路可单独替换。
+结论只限推理期依赖，不等于去掉该路证据重训的结果。--mean-list 用该折训练景估计均值，
+避免在被评分的景上估替换值。
 
-做法（三点设计，直接决定结论能不能立住）
-----------------------------------------
-1. **用"数据集均值"替换，不是置零**。门控第一层是 conv(1120→64) 后接 BN，BN 的 running
-   stats 是带着真实证据统计训出来的；置零会整体平移 conv1 的输出分布，掉下来的分数分不清
-   是"信息没了"还是"分布错位"。换成每通道均值 ⇒ 只拿掉**空间/结构信息**、保留量级。
-   （`--sub zero` 保留作对照，但主结论请用 mean。）
-2. **证据有两个消费者**：尺度轴 transformer 的证据 token 与门控输入。只换一路只覆盖一半，
-   所以默认跑 both / 仅 gate / 仅 xattn 三档。
-3. **两路证据可分别消融**：证据张量是 `cat([vario 64ch, pol 32ch])`，可单独换掉任一路
-   ⇒ **免训练地回答"两条物理先验哪条在起作用"**。
-   ⚠️ 解释有界：这是"训练好的模型在推理时还依赖哪一路"，**不等于**"从头去掉那一路重训会
-   怎样"。论文里必须这样限定措辞。
-
-用法
-----
-    python -m tools.analysis.evidence_ablation                      # 默认 6 个变体，全 83 景
-    python -m tools.analysis.evidence_ablation --scenes 5           # 冒烟
-    python -m tools.analysis.evidence_ablation --config <cfg> --run <run 名>
+用法：
+    python -m tools.analysis.evidence_ablation --config configs/FLOE/pgsg.py --ckpt <ckpt> \
+        --val-list datalists/cv5/fold0_val.json --mean-list datalists/cv5/fold0_train.json
+    python -m tools.analysis.evidence_ablation --self-test     # hook 接线自检，无需 GPU/数据
 """
 import argparse
 import copy
@@ -48,6 +36,8 @@ VAL_LIST = 'datalists/val_417.json'
 VARIO_CH, POL_CH = 64, 32                 # 证据张量 = cat([vario, pol])
 
 # (标签, 替换哪几路证据, 替换给哪个消费者)
+# sub-all/gate 不等于门控完全看不到证据：门控的特征输入已经过 scale_xattn，后者仍收到真实证据，
+# 会经残差漏进门控。只有 */both 是完全移除。
 VARIANTS = [
     ('control',        None,      None),
     ('sub-all/both',   'all',     'both'),
@@ -71,7 +61,7 @@ def stream_slice(streams):
 class EvidenceAblation:
     """用 forward_pre_hook 在两个消费点替换证据；不改项目源码。
 
-    挂载点（models/sota/segformer.py `_SegformerHead.forward`）：
+    挂载点（floe/models/sota/segformer.py `_SegformerHead.forward`）：
       - `head.scale_xattn(projected, gate_evidence)`  -> args[1] 是证据张量
       - `head.scale_gate(gate_in)`，其中 gate_in = cat([x, evidence]) -> 末 ev_ch 个通道
     """
@@ -81,7 +71,6 @@ class EvidenceAblation:
         self.mean = None                  # (ev_ch,) float32 CPU
         self._handles = []
 
-    # ---------------------------------------------------------------- 均值估计
     def estimate_mean(self, loader, opts, n_scenes, device):
         """前置小规模 pass，累计证据的逐通道均值（不挂替换钩子）。"""
         sums = torch.zeros(self.ev_ch, dtype=torch.float64)
@@ -116,7 +105,6 @@ class EvidenceAblation:
               f'pol |mean| 均值 {self.mean[VARIO_CH:].abs().mean():.4f}')
         return self.mean
 
-    # ---------------------------------------------------------------- 替换钩子
     def enable(self, streams, consumers, sub='mean'):
         self.disable()
         if streams is None or consumers is None:
@@ -166,7 +154,7 @@ class EvidenceAblation:
 
 
 def self_test():
-    """hook 接线自检（无卡可跑、不碰数据/GPU）：验证替换只命中该命中的通道。
+    """hook 接线自检（CPU 可跑、不碰数据/GPU）：验证替换只命中该命中的通道。
 
     造两个与真模块同接口的假模块：
       - scale_gate: 吃 cat([x, evidence]) 的单入张量（证据在末 ev_ch 个通道）
@@ -260,6 +248,9 @@ def main():
     ap.add_argument('--val-list', default=VAL_LIST)
     ap.add_argument('--scenes', type=int, default=None, help='只跑前 N 景（冒烟用）')
     ap.add_argument('--mean-scenes', type=int, default=8, help='估均值用几景')
+    ap.add_argument('--mean-list', default=None,
+                    help='估均值所用名单（应为该折 train 名单）；缺省沿用 --val-list，'
+                         '即在被评分的景上估替换值')
     ap.add_argument('--sub', default='mean', choices=['mean', 'zero'])
     ap.add_argument('--dump-cm', default='/root/autodl-tmp/cm/evabl/pgsg')
     ap.add_argument('--self-test', action='store_true',
@@ -307,8 +298,20 @@ def main():
 
     abl = EvidenceAblation(net, head, ev_ch)
     if args.sub == 'mean':
-        print(f'\n[1/2] 估计证据逐通道均值（前 {args.mean_scenes} 景）…', flush=True)
-        abl.estimate_mean(new_loader(), opts, args.mean_scenes, device)
+        if args.mean_list:
+            mean_files = json.load(open(args.mean_list, encoding='utf-8'))
+            overlap = set(mean_files[:args.mean_scenes]) & set(files)
+            assert not overlap, f'--mean-list 与验证景重叠：{sorted(overlap)[:3]}'
+            src = args.mean_list
+        else:
+            mean_files = files
+            src = args.val_list + '（⚠️ 与被评分的景相同）'
+            print('⚠️ 未给 --mean-list：替换均值在验证景上估计（历史口径）', flush=True)
+        print(f'\n[1/2] 估计证据逐通道均值（{src} 前 {args.mean_scenes} 景）…', flush=True)
+        mean_ds = AI4ArcticChallengeTestDataset(options=opts, files=mean_files, mode='train')
+        abl.estimate_mean(torch.utils.data.DataLoader(mean_ds, batch_size=None, num_workers=0,
+                                                      shuffle=False),
+                          opts, args.mean_scenes, device)
 
     n_cls = opts['n_classes'][chart]
     results, scene_ids = {}, []
@@ -337,7 +340,7 @@ def main():
         scene_ids.append(sid)
         print('%-44s hard-ice %s' % (sid[:44], ' '.join(line)), flush=True)
 
-    # ---------------------------------------------------------------- 汇总
+    # 汇总
     base_iou = cm_iou(global_cm['control'])
     base_hard = float(np.mean([base_iou[2], base_iou[3]]))
     base_macro = float(base_iou.mean())
