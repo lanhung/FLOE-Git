@@ -1,41 +1,20 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-诊断②：从 per-scene 混淆矩阵回答两个问题。不需要 GPU（几秒）。
+从逐景混淆矩阵（tools.evaluate --dump-cm 的输出）做诊断，无需 GPU，几秒跑完。
 
-先用 evaluate_scenes.py --dump-cm 把每个 checkpoint 的 per-scene CM 落盘，再跑本脚本。
+  ① 全局逐类 IoU 与混淆矩阵；
+  ② 合并两类（--merge）后的 IoU：合并后大幅上升说明模型能找到该区域、只是分不开这两类；
+  ③ 按场景 bootstrap 的 mIoU 95% CI（像素不独立，重采样单位是场景）；多模型时用配对
+     bootstrap（同一组重采样场景喂给所有模型）给出 P(A > B)，消掉场景难度的共同波动；
+  ④ 恰好两个模型时：逐类差异分解，焦点类逐景明细与 leave-one-scene-out。
 
-问题 A：小/中浮冰是"找不到"还是"分不开"？
-    把 small(2) 和 medium(3) 合并成一类，重算 IoU。
-      - 合并类 IoU 跳到 ~0.5+，而单独的 small/medium 只有 .25/.14
-        → 模型完全能"找到"小/中浮冰区域，只是分不开这两类。
-        那么再换 backbone 是浪费——真问题是这两类在 80m 像元下到底可不可分
-        （交给 floe_separability.py 回答）。
-      - 合并类 IoU 仍然只有 ~0.3
-        → 是检测问题，架构/loss 还有得调。
-
-问题 B：模型排名有没有统计效力？
-    val 只有 30 景，而 Big/Vast 只可能来自那 8 景加拿大北极图中落到 val 的那 1~2 景
-    （见 analyze_val_split.py）。模型间 mIoU 的差距 93% 来自 Big 一类。
-    本脚本按【场景】做 bootstrap 重采样（这才是独立同分布的单位，像素不是），
-    给出 mIoU 的 95% CI；多模型时用【配对】bootstrap（同一组重采样场景喂给所有模型）
-    给出 P(A > B)——配对能消掉场景难度的共同波动，是比各自 CI 是否重叠更灵敏的检验。
-
-用法
-----
-    # 单模型
-    python -m tools.analysis.scene_cm --cm work_dir/floe_sota_segformer/cm.npz
-
-    # 多模型横比（推荐）
-    python -m tools.analysis.scene_cm \
-        --cm work_dir/floe_sota_segformer/cm.npz \
-             work_dir/floe_sota_swin/cm.npz \
-             work_dir/floe_pa2_swin_tile/cm.npz \
-             work_dir/floe_unet_tile/cm.npz \
-        --labels segformer swin pa2_swin unet
+用法：
+    python -m tools.analysis.scene_cm --cm a.npz b.npz --labels baseline pgsg [--merge 2+3]
 """
 import argparse
 import os
+
 
 def _cpu_quota():
     try:
@@ -48,6 +27,7 @@ def _cpu_quota():
     return len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else (os.cpu_count() or 1)
 
 
+# 限制 BLAS 线程（须在 import numpy 之前），否则 numpy 按宿主机核数开线程
 _N = str(max(1, min(8, _cpu_quota())))
 for _v in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS', 'NUMEXPR_NUM_THREADS'):
     os.environ.setdefault(_v, _N)
@@ -60,18 +40,16 @@ NAMES = ['water', 'cake', 'small', 'medium', 'big', 'vast']
 def parse_args():
     p = argparse.ArgumentParser(description='从 per-scene 混淆矩阵做合并类 IoU 与按景 bootstrap')
     p.add_argument('--cm', nargs='+', required=True,
-                   help='evaluate_scenes.py --dump-cm 产出的 .npz，可给多个做横比')
+                   help='tools.evaluate --dump-cm 产出的 .npz，可给多个做横比')
     p.add_argument('--labels', nargs='*', default=None, help='与 --cm 一一对应的模型名')
     p.add_argument('--merge', nargs='+', default=['1+2'],
                    help='要考察的合并方案，形如 1+2（cake+small）、4+5（大+巨）。可给多个。'
-                        '默认 1+2：项目现行合并口径（用户 2026-07-18 定），'
-                        'small+medium(2+3) 的实验线已于 07-13 关闭，不再默认分析')
+                        '默认 1+2（cake+small）')
     p.add_argument('--n-boot', type=int, default=5000)
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--drop-empty', action='store_true',
                    help='报告 mIoU 时剔除在 GT 与预测中都不出现的类'
-                        '（如 2026-07-16 扩充前为空的类 1 饼状冰）。'
-                        '默认关闭，以便与已报的 6 类 mIoU 直接对齐。')
+                                                '默认关闭，以便与已报的 6 类 mIoU 直接对齐。')
     p.add_argument('--focus-class', nargs='*', default=None,
                    help='（恰好两个模型时）第④节逐景分解的焦点类，类名（medium）或下标（3），'
                         '可给多个；缺省自动取两模型全局 IoU 差最大的前 2 类')
@@ -89,7 +67,7 @@ def iou_from_cm(cm, drop_empty=False):
         present = denom > 0
         miou = iou[present].mean() if present.any() else 0.0
     else:
-        # 与 derive_metrics_from_cm 一致：空类的 IoU 记为 0 且计入分母
+        # 与 tools.evaluate.derive_metrics_from_cm 一致：空类的 IoU 记为 0 且计入分母
         miou = iou.mean()
     return iou, float(miou)
 
@@ -160,9 +138,7 @@ def main():
     C = models[0]['cm'].shape[1]
     print(f'{S} 个验证场景，{C} 类，{len(models)} 个模型：{", ".join(labels)}')
 
-    # ---------------------------------------------------------------- #
-    # 1. 全局指标 + 逐类 IoU（自检：应能复现 CLAUDE.md 实验表里的数字）
-    # ---------------------------------------------------------------- #
+    # ① 全局指标 + 逐类 IoU（应与 tools.evaluate 报告的数字一致）
     print(f'\n{"=" * 90}')
     print('  ① 全局 per-class IoU（自检：应与已报数字一致）')
     print(f'{"=" * 90}')
@@ -177,9 +153,7 @@ def main():
 
     print_confusion(globals_cm[0], f'{labels[0]} 的混淆矩阵')
 
-    # ---------------------------------------------------------------- #
-    # 2. 合并类 IoU —— 核心问题："找不到" 还是 "分不开"？
-    # ---------------------------------------------------------------- #
+    # ② 合并类 IoU："找不到"还是"分不开"
     for spec in args.merge:
         groups, mnames = groups_for(spec, C)
         merged_idx = [int(x) for x in spec.split('+')]
@@ -203,7 +177,7 @@ def main():
             print(f'  {lab:<14s} ' + ''.join(f'{iou[m]:9.3f}' for m in merged_idx) +
                   f' | {merged_iou:9.3f} {merged_iou - best_single:+8.3f}')
 
-        # 判读：取合并后表现最好的那个模型，看它【自己】涨了多少
+        # 判读：取合并后表现最好的那个模型，看它自己涨了多少
         lab_b, merged_b, single_b = max(gains, key=lambda t: t[1])
         gain_b = merged_b - single_b
         print()
@@ -221,9 +195,7 @@ def main():
             print(f'  ➤ {lab_b}：合并后 IoU={merged_b:.3f}（单类最好 {single_b:.3f}，'
                   f'{gain_b:+.3f}），介于两者之间，两个因素都有份。')
 
-    # ---------------------------------------------------------------- #
-    # 3. 按【场景】bootstrap —— 排名有没有统计效力？
-    # ---------------------------------------------------------------- #
+    # ③ 按场景 bootstrap：排名有没有统计效力
     rng = np.random.default_rng(args.seed)
     B = args.n_boot
     boot_idx = rng.integers(0, S, size=(B, S))          # 所有模型共用，实现配对
@@ -275,10 +247,7 @@ def main():
         print('\n  * = 该配对差异在场景重采样下稳定（p>0.95）。没有 * 的配对，'
               '其 mIoU 差距无法与场景抽样噪声区分。')
 
-    # ---------------------------------------------------------------- #
-    # 4. 两模型逐类差异分解 —— 差异来自哪些类、哪些场景？
-    #    （2026-07-18 加入，用于 b5 vs b2 的 medium +0.10 归因）
-    # ---------------------------------------------------------------- #
+    # ④ 两模型逐类差异分解：差异来自哪些类、哪些场景
     if M == 2:
         la, lb = labels
         cma, cmb = all_cm[0], all_cm[1]                    # (S, C, C)
@@ -302,8 +271,7 @@ def main():
         print('  ' + '-' * 60)
         for c in range(C):
             p = float((boot_cls[0, :, c] > boot_cls[1, :, c]).mean())
-            # 差异实际为零（如两模型某空类恒同为 0）时严格 > 会给出 p=0，
-            # 不应据此标"显著"——加 |diff| 门槛抑制。
+            # 差异为零（如某空类两模型恒为 0）时严格 > 给出 p=0，不应标显著，故加 |diff| 门槛。
             mark = '*' if (p > 0.95 or p < 0.05) and abs(diff[c]) > 1e-9 else ' '
             print(f'  {NAMES[c]:<8s} {iou_a[c]:10.3f} {iou_b[c]:10.3f} {diff[c]:+8.3f} '
                   f'{p:17.3f}{mark}')
@@ -353,8 +321,8 @@ def main():
             if not loo_by_scene or base_diff == 0:
                 print(f'  ➤ 全局 diff 为 0 或无含该类的场景，无单景归因可做。')
                 continue
-            # 判读：取对全局差影响最大的景（|base_diff - loo| 最大），不是像素最多的景——
-            # 差异也可能由一个 GT 中等、但 IoU 摆动极大的景主导。
+            # 取对全局差影响最大的景（|base_diff - loo| 最大）而非像素最多的景：差异也可能由
+            # GT 中等但 IoU 摆动极大的景主导。
             s_top = max(loo_by_scene, key=lambda s: abs(base_diff - loo_by_scene[s]))
             loo_top = loo_by_scene[s_top]
             top_name = ref[s_top][:42]
