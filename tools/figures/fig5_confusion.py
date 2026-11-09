@@ -1,18 +1,10 @@
-"""T0-0.1 + Fig. 5：fold0 混淆矩阵分析与绘图（无卡模式安全，纯 numpy）。
+"""Fig. 5：基线 vs PGSG 的行归一化混淆矩阵（两联图）。纯 numpy，CPU 可跑。
 
-产出
-----
-1) 打印 Introduction 动机 C 需要的数字：基线上 true-big 被判成 small / medium 的比例；
-   顺带打印全部逐类 IoU（与实验表对拍，防止读错文件）。
-2) Fig. 5：基线 vs PGSG 的行归一化混淆矩阵热图（两联图）。
+同时打印逐类 IoU（与实验表对拍，防止读错文件）以及 true-big / true-medium 被判成各类的比例。
+输入是 tools.evaluate --dump-cm 的 .npz（scenes (S,)、cm (S,C,C)，行=真实、列=预测），
+默认 $FLOE_CM_DIR/baseline.npz 与 pgsg.npz。
 
-用法
-----
-    python -m tools.figures.fig5_confusion                                  # 用默认路径
-    python -m tools.figures.fig5_confusion --baseline <npz> --pgsg <npz>
-
-默认读 /root/autodl-tmp/cm/single/{b2dlr_f0,pgsg}.npz（evaluate_scenes --dump-cm 的输出，
-键：scenes (S,)、cm (S,C,C) 行=真实列=预测）。
+用法：python -m tools.figures.fig5_confusion [--baseline <npz>] [--pgsg <npz>]
 """
 import argparse
 import os.path as osp

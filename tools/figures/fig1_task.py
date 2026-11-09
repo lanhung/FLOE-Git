@@ -1,7 +1,6 @@
-"""Fig. 1：任务示意（SAR 切片 + 标签叠色 + 六类米尺轴）。无卡模式安全。
+"""Fig. 1：任务示意（SAR 切片 + 标签叠色 + 六类尺度轴）。
 
-内存纪律：只用 h5py 读**一个 512×512 的对齐 tile**（每变量约 1MB），绝不整景解码。
-候选 tile 由 tile 索引直接挑选（索引里存了每个 tile 的逐类像元直方图）。
+只用 h5py 读一个 512×512 的对齐 tile；候选 tile 按 tile 索引里的逐类像元直方图挑选。
 
 用法
 ----
@@ -92,7 +91,7 @@ def main():
         x0 = np.log10(max(lo, 12))
         ax2.barh(k, np.log10(hi) - x0, left=x0, height=0.34,
                  color=CLASS_COLORS[cls], edgecolor='none')
-        # 文字放在色条**上方**，避免窄条（cake/small）里放不下而被裁掉
+        # 文字放在色条上方：窄条（cake/small）里放不下
         ax2.text(x0, k + 0.30,
                  f'{CLASS_NAMES[cls]} ({CLASS_RANGE[cls].replace("$<$", "<").replace("--", "-")})',
                  va='bottom', ha='left', fontsize=6.2, color='#222222')

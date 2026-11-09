@@ -1,25 +1,13 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""FLOE-SOTA config 冒烟测试：在【启动训练之前】验证一个模型 config 能端到端跑通。
+"""冒烟测试：在启动训练之前验证模型 config 能端到端跑通。有 GPU 用 GPU，否则用 CPU（只验证正确性）。
 
-为什么必须先冒烟（2026-07-10 教训）：多模型 benchmark 里每个 config 都是新架构 + 新
-输入通道口径，任何一处对不上（通道数、输出不是 {chart:tensor} dict、n_classes 传错）
-都会在训练启动后几分钟才崩，浪费排队时间。本脚本一次性验证：
-
-  1. config 能加载 + 与 _sota_base / base 正确合并；
-  2. get_model 能实例化，参数量、期望输入通道数打印出来；
-  3. 真实 tile 采样出的一个 batch，通道数与模型期望一致；
-  4. 前向 + 反向 + AMP（GradScaler + clip_grad_norm_，与 quickstart 完全一致）loss 有限；
-  5. 模型输出是 {'FLOE': (B, 6, H, W)} dict；
-  6. 验证推理路径（fast_tiled_val_inference → class_decider → 混淆矩阵累加）跑通、形状对。
-
-设备自适应：有 GPU 就用 GPU（顺带给时序），无卡模式下用 CPU（只验证正确性，较慢但够用）。
-所以本脚本在无卡模式下也能跑，用于开卡前先把所有 config 过一遍。
+检查 config 合并、模型实例化、真实 tile batch 的通道数、前向 + 反向 + AMP（与训练循环一致）
+的 loss 有限、输出为 {'FLOE': (B, 6, H, W)}、验证推理与混淆矩阵累加，以及 tile 门控 /
+confmat 模式与全量前向路径的等价性（[7a]-[7d]）。
 
 用法：
-    python -m tools.checks.smoke_pipeline configs/FLOE/sota_deeplabv3.py
-    python -m tools.checks.smoke_pipeline configs/FLOE/sota_deeplabv3.py configs/FLOE/sota_segformer.py configs/FLOE/sota_segnet.py
-    python -m tools.checks.smoke_pipeline            # 不给参数则默认测这三个
+    python -m tools.checks.smoke_pipeline [CFG ...]     # 不给参数则测 DEFAULT_CONFIGS
 """
 import contextlib
 import copy
@@ -29,7 +17,6 @@ import sys
 import time
 import warnings
 
-import numpy as np
 import torch
 from mmcv import Config
 
@@ -40,18 +27,6 @@ from floe.functions import (get_model, get_optimizer, get_loss, fast_tiled_val_i
                        batched_slide_inference, class_decider,
                        new_confusion_matrix, accumulate_confusion_matrix)
 
-# 当前批次（2026-07-31 T 批：换 loss / 加辅助任务 / 换架构族）。
-# 三枪各有专属风险点，冒烟必须逐个看日志而不只看 PASS：
-#   focal          : FocalLoss 的 get_loss 分派 + val loss 按批聚合兼容性（alpha 权重不
-#                    进分母，_loss_is_mean_over_valid 应判 True → val loss 不该是 nan）；
-#   mtsic          : aux_charts 机制全链路（8 通道输入 + SIC 标签读取、模型双头输出、
-#                    验证只跑 FLOE 单任务）。⚠️ 开跑前必须先过 _audit_sic_vars.py，
-#                    确认 417 景里 SIC 变量齐全且取值口径正确；
-#   upernet_swinv2 : 触发第 [7b] 步 fp32 仲裁的那一枪（fp16 下门控差异 margin 1.24e-2
-#                    略超阈值，[7a] 已证索引无 bug）——CPU/fp32 仲裁通过即放行。
-# 上一批（2026-07-30 S 批）：sota_upernet_swinv2_in1k_dlr_417 / sota_dpt_dino_dlr_417 /
-# sota_upernet_mitb2_in1k_dlr_417；再上一批（2026-07-10 从零 benchmark）：
-# sota_deeplabv3 / sota_segformer / sota_segnet / sota_swin。都可作命令行参数回归。
 DEFAULT_CONFIGS = ['configs/FLOE/sota_segformer_in1k_dlr_417.py', 'configs/FLOE/pgsg.py']
 
 
@@ -62,20 +37,18 @@ def smoke_one(cfg_path, device, cuda):
 
     opts = get_variable_options(Config.fromfile(cfg_path).train_options)
     opts['diag_log_every_batches'] = 0
-    # 冒烟只需少量 CPU 读取；无卡模式 CPU 很弱，别开一堆 worker。
-    # num_workers_val 也置 0：swin 的 batched_slide_inference 内部会起 DataLoader。
+    # num_workers_val 也要置 0：swin 的 batched_slide_inference 内部会起 DataLoader。
     opts['num_workers'] = 0
     opts['num_workers_val'] = 0
 
-    # 验证侧 options：辅助任务（aux_charts）是 train-only 的，验证只跑 target chart。
-    # 无 aux_charts 时 opts_val 就是 opts 本身（同一对象），不带 aux 的 config 行为不变。
+    # 辅助任务（aux_charts）只用于训练，验证只跑 target chart；无 aux_charts 时 opts_val 就是 opts。
     opts_val = val_scoped_options(opts)
 
     target = opts.get('target_chart', 'FLOE')
     n_cls = opts['n_classes'][target]
     n_tex = 0
     if opts.get('texture_channels', False):
-        from floe.loaders import N_TEXTURE_CHANNELS  # B1：训练 _augment_x 追加 N 个纹理通道
+        from floe.loaders import N_TEXTURE_CHANNELS  # 训练 _augment_x 追加 N 个纹理通道
         n_tex = N_TEXTURE_CHANNELS
     exp_in_ch = (len(opts['train_variables'])
                  + (2 if opts.get('month_encoding', False) else 0)
@@ -86,12 +59,12 @@ def smoke_one(cfg_path, device, cuda):
           f'(pol_ratio={opts.get("pol_ratio_channel", False)}, '
           f'texture={opts.get("texture_channels", False)})', flush=True)
 
-    # --- 2. 建模型 ---
+    # [2] 建模型
     net = get_model(opts, device)
     n_param = sum(p.numel() for p in net.parameters())
     print(f'[2] model built OK | params = {n_param / 1e6:.2f} M', flush=True)
 
-    # --- 3+4+5. 真实 batch 前向/反向 ---
+    # [3-5] 真实 batch 前向/反向
     net.train()
     optimizer = get_optimizer(opts, net)
     scaler = torch.cuda.amp.GradScaler(enabled=cuda)
@@ -132,16 +105,13 @@ def smoke_one(cfg_path, device, cuda):
     print(f'[3-5] train step OK | batch_x {tuple(bx.shape)} -> out[{target}] '
           f'{tuple(out[target].shape)} | loss = {loss.item():.4f} (finite)', flush=True)
 
-    # --- 6. 验证推理路径（合成小场景，避免在 CPU 上跑整景）---
-    # 走与 quickstart 完全一致的分派：'swin' 用 batched_slide_inference（滑窗），
-    # 其余大图用 fast_tiled_val_inference。这样 swin 的真实验证路径也被覆盖到。
-    # ⚠️ 合成景仅 700×900，不足以暴露 batched_slide 在最大验证景(176 Mpx)上的显存峰值——
-    # swin 的显存风险点是首次真实验证，本冒烟测不出，见 sota_swin.py 顶部说明。
+    # [6] 验证推理路径（合成小场景，避免在 CPU 上跑整景），分派同训练循环：
+    # 'swin' 用 batched_slide_inference（滑窗），其余用 fast_tiled_val_inference。
+    # 700×900 的合成景测不出最大验证景上的显存峰值。
     net.eval()
     H, W = 700, 900   # 会被 pad 到 256 的倍数
-    # 验证合成输入用【基础通道数】(不含纹理)：真实 prep_scene 整景是基础通道数，B1 纹理由
-    # fast_tiled_val_inference/predict 里 per-tile 现算补上。若用 exp_in_ch(含纹理)会被验证
-    # 函数再补一次纹理→双计(12+4=16)而崩——这正是修此测试脚本口径的原因。
+    # 验证输入用基础通道数：纹理通道由 fast_tiled_val_inference/predict 逐 tile 现算补上，
+    # 传 exp_in_ch 会被重复追加。
     val_in_ch = exp_in_ch - n_tex
     fake_x = torch.randn(1, val_in_ch, H, W, device=device)
     fake_true = torch.randint(0, n_cls, (H, W), device=device)
@@ -161,26 +131,19 @@ def smoke_one(cfg_path, device, cuda):
     print(f'[6] val inference OK | {val_path} -> {tuple(vout[target].shape)} | '
           f'confmat total = {int(cm.sum())}', flush=True)
 
-    # --- 7. tile 门控等价性（2026-07-25 新增）---
-    # 造一个「大片 255」的标签，使一部分 tile 完全无效，然后把两条路径对拍：
+    # [7] tile 门控等价性：构造大片 255 的标签使部分 tile 全无效，对拍
     #   旧：fast_tiled_val_inference（全量前向）+ class_decider
     #   新：fast_tiled_val_predict（门控 + 流式 argmax）
-    #
-    # 分两级断言，因为两者的性质不同：
-    #   7a) gate=False：tile 顺序和分批与旧路径【完全一致】，只是换了取 tile / 写回的
-    #       写法 → 必须【全图逐像素相同】。这一项挂了就是索引 bug。
-    #   7b) gate=True：跳过 tile 会改变每批的组成，cuDNN 可能因此选到不同算法，fp16 下
-    #       末位差 1 ULP，恰好碰上 argmax 平局就会翻。所以只要求「差异比例极小、且差异
-    #       像素处 top1-top2 的 logit 间隔接近 0（= 确实是平局）」。实测 b5 在随机噪声
-    #       输入上翻 0.03%、间隔 max 1.2e-4（全体中位数 2.5e-2）；真实数据上间隔更大、
-    #       翻得更少。同样的抖动在今天改 val_batch_size 时就存在。
+    # 7a) gate=False：tile 顺序与分批同旧路径，必须全图逐像素相同，否则是索引 bug。
+    # 7b) gate=True：跳过 tile 会改变批组成，cuDNN 可能选到不同算法，fp16 下末位差 1 ULP
+    #     会让 argmax 平局翻转。只要求差异比例极小、差异像素的 top1-top2 间隔接近 0
+    #     （随机噪声输入上实测翻 0.03%、间隔 max 1.2e-4）。
     # swin 走滑窗、不经过 tile 路径，跳过本项。
     if opts['model_selection'] != 'swin':
         ps = opts['patch_size']
         lab = torch.full((H, W), 255, dtype=torch.long)
-        # 左上一块（整 tile）+ 右下角一块（同时落在【右、下都不足 patch_size】的残缺
-        # tile 里），后者专门覆盖门控路径下的边缘补齐分支。H=700/W=900、ps=256 时
-        # tile 网格是 3×4，这样恰好留下 5 个有效 tile、7 个全无效 tile。
+        # 左上一块整 tile + 右下角一块（落在右、下都不足 patch_size 的残缺 tile 里，覆盖边缘
+        # 补齐分支）。H=700/W=900、ps=256 时 tile 网格 3×4，留下 5 个有效、7 个全无效 tile。
         lab[0:500, 0:400] = torch.randint(0, n_cls, (500, 400))
         lab[600:700, 800:900] = torch.randint(0, n_cls, (100, 100))
         valid = lab != 255
@@ -215,9 +178,8 @@ def smoke_one(cfg_path, device, cuda):
             lg = ref_logits[0].float().cpu().permute(1, 2, 0)[valid]   # (n_valid, C)
             top2 = lg[diff].topk(2, dim=1).values
             margin = float((top2[:, 0] - top2[:, 1]).max())
-        # 阈值卡在边界上时（实测 UPerNet+SwinV2 在 fp16 下 margin 1.24e-2 刚超 1e-2，而
-        # [7a] 的逐像素相同已经证明索引没 bug），转 CPU/fp32 仲裁把「数值噪声」与「真 bug」
-        # 就地分开：fp32 下门控只改变每批的组成，不该产生【任何】差异。
+        # fp16 噪声可能刚好超过阈值（UPerNet+SwinV2 实测 margin 1.24e-2），此时转 CPU/fp32
+        # 仲裁：fp32 下门控只改变批组成，不应产生任何差异。
         try:
             assert n_diff <= 0.005 * n_valid_px, \
                 f'门控前后预测差异过大：{n_diff}/{n_valid_px}（>0.5%，不像平局翻转）'
@@ -225,9 +187,9 @@ def smoke_one(cfg_path, device, cuda):
                 f'门控前后差异像素的 top1-top2 间隔达 {margin:.3e}，不是平局翻转，是真的算错了'
         except AssertionError as _e:
             if not cuda:
-                raise      # CPU 本来就是 fp32，这里失败就是真失败，没有仲裁余地
+                raise      # CPU 本来就是 fp32，没有仲裁余地
             print(f'[7b] fp16 断言未通过（{_e}）→ 转 CPU/fp32 仲裁', flush=True)
-            # 不动 net 本身的 device/dtype/状态：仲裁用一份独立的 fp32 CPU 副本。
+            # 仲裁用独立的 fp32 CPU 副本，不改 net 本身的 device/dtype/状态。
             net32 = copy.deepcopy(net).float().cpu().eval()
             x32 = fake_x.detach().float().cpu()
             with torch.no_grad():        # 刻意不进 autocast：全程 fp32
@@ -245,8 +207,7 @@ def smoke_one(cfg_path, device, cuda):
                     f'⚠️ 但 CPU fp32 下不同批尺寸也可能让 MKL 选到不同分块、产生极小数值差；'
                     f'若差异只有个位数像素，需人工看一眼这些像素的 top1-top2 间隔再定性，'
                     f'不必然是索引 bug。原 fp16 断言：{_e}')
-            # 仲裁通过 ≠ 无条件放行：fp32 证明了"不是索引 bug"，但 fp16 若不稳到翻掉 5%
-            # 以上的有效像元，验证指标本身就会被数值噪声污染，这枪照样不能上。
+            # fp32 通过只说明不是索引 bug；fp16 下翻转超过 5% 有效像元时验证指标本身已被噪声污染。
             if n_diff > 0.05 * n_valid_px:
                 raise AssertionError(
                     f'CPU/fp32 仲裁通过（fp32 下逐像素相同 ⇒ 不是索引 bug），但 fp16 下门控'
@@ -256,9 +217,7 @@ def smoke_one(cfg_path, device, cuda):
                   f'margin {margin:.3e}），放行', flush=True)
         if math.isnan(gated_loss):
             # 不可按批聚合的 loss（Dice/Lovász/带类权重 CE）按设计记 nan（见
-            # functions._loss_is_mean_over_valid），跳过数值对拍——否则 abs(nan-nan)
-            # 恒 False，冒烟会以「loss 不一致：nan vs nan」的误导面目失败（code-review
-            # P2-2/N2）。[7c]/[7d] 会继续断言两条路径的 nan 判定一致。
+            # functions._loss_is_mean_over_valid），无法对拍；[7c]/[7d] 断言两条路径的 nan 判定一致。
             print('[7b] val loss 为 nan（该 loss 不满足「Σ逐像素/有效像元数」形式，'
                   '按设计不做按批聚合）→ 跳过 loss 对拍', flush=True)
         else:
@@ -269,16 +228,11 @@ def smoke_one(cfg_path, device, cuda):
               f'gated diff {n_diff}/{n_valid_px} (max margin {margin:.1e}) | '
               f'loss {gated_loss:.4f} vs {ref_loss:.4f}', flush=True)
 
-        # 7c) confmat 模式（2026-08-06 新增，quickstart 验证循环默认走它）：同 gate 值下
-        #     批组成与 preds 模式完全一致 ⇒ logits 逐位相同 ⇒ GPU 逐批 bincount 出的混淆
-        #     矩阵应与「preds 模式 + valid 掩膜筛选 + accumulate_confusion_matrix」
-        #     【整数级完全相等】。两次独立前向之间若存在非确定性算子（atomicAdd 类
-        #     conv 回退），允许退一步：行和（= true 支撑，与预测无关）必须精确相等、
-        #     翻转像素 ≤ 0.5%（平局翻转，与 [7b] 同一性质）。loss 聚合算式逐位一致。
-        #     顺带做「无逐批同步」的经验性验证（code-review P1-1 的教训：bincount 版每批
-        #     同步两次，注释吹的重叠根本不存在）：sync_debug_mode('warn') 下数同步次数。
-        #     预期只有函数末尾取回 loss 累加器的少量同步；只打印不断言（模型前向内部
-        #     可能有架构相关的合法同步，硬阈值会误伤）。
+        # 7c) confmat 模式（训练验证循环的默认路径）：同 gate 下批组成与 preds 模式相同，GPU 逐批
+        #     累加的混淆矩阵应与「preds + valid 掩膜筛选 + accumulate_confusion_matrix」整数级相等。
+        #     两次前向间若有非确定性算子，退一步要求行和精确相等、翻转像素 ≤ 0.5%。
+        #     另在 sync_debug_mode('warn') 下统计 CUDA 同步次数，只打印不断言（模型前向内部
+        #     可能有架构相关的合法同步）。
         _sync_n = None
         _has_sync_dbg = cuda and hasattr(torch.cuda, 'set_sync_debug_mode')
         if _has_sync_dbg:
@@ -292,8 +246,8 @@ def smoke_one(cfg_path, device, cuda):
                         fake_x, net, opts_val, labels={target: lab}, valid_maps={target: valid},
                         loss_fns=loss_fn, task_weights=opts_val['task_weights'], out='confmat')
             if _has_sync_dbg:
-                # 只数 sync 警告本身；同一 catch 里可能混进别的警告（如 val loss 不可
-                # 按批聚合的 RuntimeWarning），不能一锅端。
+                # 只数同步警告：同一 catch 里可能混进别的警告（如 val loss 不可按批聚合的
+                # RuntimeWarning）。
                 _sync_n = len([w for w in _sync_w
                                if 'synchron' in str(w.message).lower()])
         finally:
@@ -313,8 +267,7 @@ def smoke_one(cfg_path, device, cuda):
             assert row_ok and cm_flip <= 0.005 * n_valid_px, \
                 (f'confmat 模式与 preds 模式不等价：行和一致={row_ok}、差异像素 '
                  f'{cm_flip}/{n_valid_px}——超出两次前向间数值噪声的量级，是真 bug')
-        # loss 对拍：不可按批聚合的 loss（Dice/带类权重 CE 等）两边都记 nan，是设计行为
-        # 而非等价性失败（code-review P2-2）。
+        # 不可按批聚合的 loss 两边都记 nan，是设计行为。
         if math.isnan(cm_loss) or math.isnan(gated_loss):
             assert math.isnan(cm_loss) and math.isnan(gated_loss), \
                 (f'nan 不对称：confmat {cm_loss} vs preds {gated_loss}——两条路径对'
@@ -327,11 +280,9 @@ def smoke_one(cfg_path, device, cuda):
               + (f' | CUDA syncs {_sync_n}（预期为个位数：仅函数末尾取回 loss）' if _sync_n is not None else ''),
               flush=True)
 
-        # 7d) n_valid==0 守卫覆盖（code-review P2-1）：val_batch_size=1 + gate=False ⇒
-        #     7 个全 255 的 tile 各自成批，逐一命中「整批无有效像元」分支。where 守卫
-        #     失效的话 loss 会被 nan 污染且【不报错】——这里显式断言 loss 有限且与整景
-        #     一次算完的 ref_loss 一致。CM 与 ungated preds 模式对拍（批组成不同，允许
-        #     平局翻转但行和必须精确相等，与 [7b]/[7c] 同性质）。
+        # 7d) n_valid==0 守卫：val_batch_size=1 + gate=False 时 7 个全 255 的 tile 各自成批，
+        #     逐一命中「整批无有效像元」分支；守卫失效时 loss 会被 nan 污染且不报错。
+        #     CM 与 ungated preds 模式对拍（批组成不同，允许平局翻转，但行和必须精确相等）。
         opts_val_b1 = dict(opts_val)
         opts_val_b1['val_batch_size'] = 1
         with torch.no_grad(), (torch.cuda.amp.autocast() if cuda else contextlib.nullcontext()):

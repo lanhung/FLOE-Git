@@ -1,20 +1,11 @@
-"""动机 B 的最后一个数：暗景里真中浮冰被判成小浮冰的比例。纯 CPU，只读已有文件。
+"""暗景里真中浮冰被判成小浮冰的比例（纯 CPU，只读已有文件）。
 
-做法
-----
-① 从 `docs/_radiometric_profile_417.csv` 取每景的 HH 均值（每景 4 tile 抽样），按它把
-   fold0 验证集的 83 景分成"暗端"与"其余"；
-② 从辐射探针 `id` 变体的逐景混淆矩阵取每景的 medium 行，算行归一化的 medium→small 比例；
-③ 分组汇总（按像元加权，不是按景平均——景的支撑差几个数量级）。
+按 docs/_radiometric_profile_417.csv（tools.analysis.radiometric_profile 的输出）的逐景 HH 均值把
+验证景分成暗端（最暗的 --quantile 比例）与其余，取辐射探针 `id` 变体逐景混淆矩阵的 medium 行，
+按像元加权汇总（各景的支撑差几个数量级）。这是观察性分组：暗景同时可能更晚、更靠北或传感器
+不同，因果由 tools.analysis.radiometric 的受控扰动检验。
 
-⚠️ 这是**观察性**分组，不是干预：暗景同时还可能更晚、更靠北、传感器不同。论文里要写成
-"in the radiometrically darkest scenes …"，**不能**写成"变暗导致了这个比例"——因果那一步
-由 Fig. 2 的受控扰动来承担。
-
-用法
-----
-    python -m tools.analysis.darkscenes
-    python -m tools.analysis.darkscenes --quantile 0.25     # 暗端取多少比例的景
+用法: python -m tools.analysis.darkscenes [--quantile 0.25]
 """
 import argparse
 import csv

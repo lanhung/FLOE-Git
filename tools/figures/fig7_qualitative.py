@@ -1,24 +1,10 @@
-"""Fig. 7：定性预测对比 [HH | GT | Baseline | PGSG]。**需要 GPU**。
+"""Fig. 7：定性预测对比 [HH | GT | Baseline | PGSG]。出图需要 GPU。
 
-为什么必须有这张图
-------------------
-论文目前一张预测图都没有，遥感分割论文不放预测图很反常；而本文最大的单类增益
-（大浮冰 +0.026，碎裂被修复）恰好是肉眼可见的差异。
+    python -m tools.figures.fig7_qualitative --rank    # 选景（CPU）：按逐景 CM 排 PGSG 在 big 上的增益
+    python -m tools.figures.fig7_qualitative --scenes <name1> <name2> [--crop r0,c0,size]
 
-两种用法
---------
-1) **选景（纯 CPU，秒级，不用 GPU）**——从两个模型的逐景混淆矩阵里排出"PGSG 相对基线
-   在大浮冰上改善最多"的场景：
-
-       python -m tools.figures.fig7_qualitative --rank
-
-2) **出图（要 GPU）**——对选定场景跑两个模型的整景推理并画 1×4：
-
-       python -m tools.figures.fig7_qualitative --scenes <name1> <name2> [--crop r0,c0,size]
-
-⚠️ 推理用 `fast_tiled_val_predict(..., gate=False)`：**必须关门控**。开门控时标签全 255 的
-tile 会被跳过、预测留 0，算指标无妨（那些像素本来就被排除），但**画整景图会出现成片的
-假"水"**——CLAUDE.md 里 `_viz_pred.py` 那条坑就是这个。
+推理用 fast_tiled_val_predict(..., gate=False)：开门控时标签全 255 的 tile 被跳过、预测留 0，
+算指标无妨，但画整景会出现成片的假"水"。
 """
 import argparse
 import copy
@@ -43,7 +29,6 @@ RUN_PGSG = 'floe_pgsg_417_s42'
 VAL_LIST = 'datalists/val_417.json'
 
 
-# ------------------------------------------------------------------ 选景（CPU）
 def rank_scenes(npz_base, npz_pgsg, cls=4, top=15):
     """按"PGSG 相对基线在指定类上的逐景 IoU 增益"排序，纯读 npz。"""
     def load(p):
@@ -68,7 +53,6 @@ def rank_scenes(npz_base, npz_pgsg, cls=4, top=15):
     return [r[4] for r in rows]
 
 
-# ------------------------------------------------------------------ 推理
 def load_net(cfg_path, ckpt, device):
     opts = get_variable_options(copy.deepcopy(Config.fromfile(cfg_path).train_options))
     assert opts['down_sample_scale'] == 1, '需原生分辨率口径'
@@ -83,9 +67,7 @@ def load_net(cfg_path, ckpt, device):
 
 def predict(x, net, opts, labels, cfv_masks):
     """gate=False：画整景必须关门控，否则被跳过的 tile 会渲染成常数 0（假"水"）。
-
-    ⚠️ valid_maps 要传 `~cfv_masks`（与 quickstart / _eval_radiometric 同口径），
-    直接传 cfv_masks 会把有效/无效反过来。
+    valid_maps 是 ~cfv_masks（与训练验证同口径），直接传 cfv_masks 会把有效/无效反过来。
     """
     valid_maps = {c: ~cfv_masks[c] for c in opts['charts']}
     with torch.no_grad(), torch.cuda.amp.autocast():

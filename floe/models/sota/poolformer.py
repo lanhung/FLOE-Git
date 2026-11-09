@@ -30,12 +30,13 @@ class _FPNHead(nn.Module):
         self.cls = nn.Conv2d(fpn_channels, n_classes, 1)
 
     def forward(self, features: list, output_size: tuple) -> torch.Tensor:
-        # Build lateral connections
         laterals = [l(f) for l, f in zip(self.laterals, features)]
         # Top-down path
         for i in range(len(laterals) - 1, 0, -1):
             laterals[i - 1] = laterals[i - 1] + F.interpolate(
                 laterals[i], size=laterals[i - 1].shape[-2:], mode='nearest')
+        # Only the finest level is decoded; fpn_convs[1:] are unused but kept so
+        # parameter init and checkpoint keys stay unchanged.
         out = self.fpn_convs[0](laterals[0])
         out = F.interpolate(out, size=output_size, mode='bilinear', align_corners=False)
         return self.cls(out)

@@ -1,22 +1,11 @@
-"""Fig. 3：PGSG 架构图（纯绘图，无数据、无模型、无 GPU；任何装了 matplotlib 的机器都能跑）。
+"""Fig. 3：PGSG 架构图。纯 matplotlib 绘图，不需要数据、模型或 GPU。
 
-为什么用 matplotlib 而不是 TikZ
-------------------------------
-本地没有 LaTeX 环境。本脚本产出与其余六张图同规格的 PDF（矢量）+ PNG（预览），
-直接 \\includegraphics 进正文即可，不引入任何新工具链。
-（`docs/fig3_architecture.tex` 是同一张图的 TikZ 备选实现，**未使用**，留档备查。）
+改图时保持三点：
+1. 证据通路（红）只有两条出边，进入尺度轴 transformer 的证据 token 与门控输入，不并入主通路（蓝）；
+2. 零初始化只有两处：尺度轴 transformer 的输出投影、门控的末层卷积；
+3. 主通路：4 个尺度特征 → 通信 → 门控加权 → concat → fuse → 分类。
 
-要表达的三件事（改图时别改丢）
-------------------------------
-1. 证据通路（红）只有两条出边，分别进入【尺度轴 transformer 的证据 token】与【门控输入】，
-   **绝不并入主通路（蓝）**——这是"证据-决策解耦"的全部含义；
-2. 零初始化点只有**两处**：尺度轴 transformer 的输出投影、门控的末层卷积
-   （证据通路刻意不做零初始化，理由见补充材料 #1 §2.2）；
-3. 主通路的形状：4 个尺度特征 → 通信 → 门控加权 → concat → fuse → 分类。
-
-用法
-----
-    python -m tools.figures.fig3_arch
+用法：python -m tools.figures.fig3_arch
 """
 from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
 
@@ -102,7 +91,7 @@ def main():
     arrow(ax, (b_gate[1], YM), (b_fuse[0], YM), MAIN)
     arrow(ax, (b_fuse[1], YM), (b_cls[0], YM), MAIN)
 
-    # ------------------------------------------------ 证据通路
+    # 证据通路
     YV, YP = 0.395, 0.180
     b_var = box(ax, 0.380, YV, 0.315, 0.125,
                 ['Variogram evidence',
@@ -135,7 +124,7 @@ def main():
     zero_mark(ax, b_xat[1] - 0.016, b_xat[3] + 0.020)
     zero_mark(ax, b_gate[1] - 0.016, b_gate[3] + 0.020)
 
-    # ------------------------------------------------ 图例
+    # 图例
     y0 = 0.035
     ax.plot([0.055, 0.095], [y0, y0], color=MAIN, lw=1.6)
     ax.text(0.104, y0, 'main feature path', va='center', fontsize=6.4)

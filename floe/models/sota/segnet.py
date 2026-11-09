@@ -35,14 +35,14 @@ class SegNet(nn.Module):
         self.charts = options['charts']
         self.n_classes = options['n_classes']
 
-        # ---------- Encoder ----------
+        # Encoder
         self.enc1 = nn.Sequential(_cbr(in_ch, 64), _cbr(64, 64))
         self.enc2 = nn.Sequential(_cbr(64, 128),   _cbr(128, 128))
         self.enc3 = nn.Sequential(_cbr(128, 256),  _cbr(256, 256),  _cbr(256, 256))
         self.enc4 = nn.Sequential(_cbr(256, 512),  _cbr(512, 512),  _cbr(512, 512))
         self.enc5 = nn.Sequential(_cbr(512, 512),  _cbr(512, 512),  _cbr(512, 512))
 
-        # ---------- Decoder ----------
+        # Decoder
         self.dec5 = nn.Sequential(_cbr(512, 512),  _cbr(512, 512),  _cbr(512, 512))
         self.dec4 = nn.Sequential(_cbr(512, 512),  _cbr(512, 512),  _cbr(512, 256))
         self.dec3 = nn.Sequential(_cbr(256, 256),  _cbr(256, 256),  _cbr(256, 128))

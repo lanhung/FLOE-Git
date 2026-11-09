@@ -1,20 +1,8 @@
-"""Fig. 6 + T0-0.3：从训练日志解析组件读数，出图 + CSV。无卡模式安全（纯文本解析）。
+"""Fig. 6：从训练日志解析 PGSG 组件读数（门控预算、选择熵、证据贡献比、跨尺度通信），出图 + CSV。
 
-为什么需要这张图
-----------------
-Introduction 把"可判读的组件级归因"列为第三条贡献（所有模块零初始化 + 训练期读数，
-使"模块是否被使用"与"模块是否有效"可以分开判定）。但正文目前一处读数都没展示——
-贡献列表里写了、正文没兑现，是评审一眼能看穿的空头支票。
-
-支持两种模式
-------------
-1) **单配置**（给一个 --logs）：3 栏 = 门控预算 / 选择熵+证据贡献 / 跨尺度通信。
-2) **双配置对比**（给两个 --logs，推荐）：4 栏 = (b) 门控预算 / (c) 门控预算 /
-   两者的选择熵+证据贡献 / (c) 的跨尺度通信。
-   ⚠️ (b) 没有尺度轴 transformer ⇒ 第 4 栏只有 (c) 一条线，这是事实不是缺数据。
-
-解析的两类日志行（由 models/sota/segformer.py 打印，触发点是第 1、100、1000、10000 次
-前向，之后每 20000 次一次 ⇒ 横轴天然是对数刻度、点很稀疏，这是设计如此）：
+给一个 --logs 出 3 栏；给两个（论文用，(b) 与 (c)）出 4 栏，其中 (b) 没有尺度轴 transformer，
+最后一栏只有 (c) 一条线。解析的日志行由 floe/models/sota/segformer.py 在第 1、100、1000、10000
+次前向及之后每 20000 次打印一次（所以横轴取对数）：
 
     [SegformerHead] gate #N (train): stage-mean g = [a, b, c, d] | 选择熵 E/1.386 nats…
         | |a|=X T=1 | 证据/特征激活贡献比 R（…）| conv1 权重 RMS f … / e …
@@ -22,13 +10,11 @@ Introduction 把"可判读的组件级归因"列为第三条贡献（所有模�
 
 用法
 ----
-    # 双配置（论文用）
     python -m tools.figures.fig6_readouts \\
         --logs /root/autodl-tmp/logs/floe_evidence_gate_417_s42.log \\
                /root/autodl-tmp/logs/floe_pgsg_417_s42.log \\
         --labels "(b) + evidence gate" "(c) PGSG (full)"
-    # 单配置
-    python -m tools.figures.fig6_readouts --logs <log>
+    python -m tools.figures.fig6_readouts --logs <log>       # 单配置
 """
 import argparse
 import csv
@@ -139,7 +125,7 @@ def main():
         cfgs.append({'label': lab, 'path': path, 'gate_all': gate, 'xatt_all': xatt,
                      'gate': g_rows, 'xatt': sel(xatt, args.split)})
 
-    # ---------------------------------------------------------------- CSV
+    # CSV
     os.makedirs(FIG_DIR, exist_ok=True)
     csv_path = args.csv or osp.join(FIG_DIR, f'{args.out}.csv')
     with open(csv_path, 'w', newline='', encoding='utf-8') as f:
@@ -160,7 +146,7 @@ def main():
             w.writerow([])
     print(f'  wrote {csv_path}')
 
-    # ---------------------------------------------------------------- 打印首末值
+    # 打印首末值
     print('\n=== 首末读数（论文正文/图注可直接引用）===')
     for c in cfgs:
         a, b = c['gate'][0], c['gate'][-1]
@@ -178,7 +164,7 @@ def main():
         else:
             print('   |resid|/|feat|    : —（该配置没有尺度轴 transformer）')
 
-    # ---------------------------------------------------------------- 画图
+    # 画图
     multi = len(cfgs) > 1
     n_panel = (2 + len(cfgs)) if multi else (2 + (1 if cfgs[0]['xatt'] else 0))
     fig, axes = plt.subplots(1, n_panel, figsize=(1.95 * n_panel + 0.5, 2.45))
