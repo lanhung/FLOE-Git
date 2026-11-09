@@ -1,82 +1,76 @@
 # FLOE-Git
 
-Sentinel-1 EW 区域主导浮冰尺寸语义分割项目。保留 SegFormer-B2 Baseline、PGSG、单次训练/评估、论文诊断及正式论文；不包含数据构建源码和五折实验流程。
+基于 Sentinel-1 EW SAR 的海冰浮冰尺寸（floe size）逐像素语义分割。标签来自业务冰图多边形的
+主导浮冰尺寸，6 类（water / cake / small / medium / big / vast），ignore index 255，80 m 网格。
+包含 SegFormer-B2 基线、PGSG（physics-guided scale gating）及其对照、AutoICE 公开基准的适配、
+论文诊断工具和论文源码。数据构建（Sentinel-1 预处理与冰图配准）代码不在本仓库。
 
 ## 目录
 
 ```text
-FLOE-Git/
-├── floe/                  公共代码与模型
-│   ├── functions.py       训练、模型构建与指标公共函数
-│   ├── loaders.py         数据读取与采样
-│   ├── evaluation.py      测试、导出与可视化辅助
-│   └── models/            PGSG/SegFormer 及必要兼容模型
-├── tools/
-│   ├── train.py           训练入口
-│   ├── evaluate.py        逐景评估入口
-│   ├── infer.py           推理入口
-│   ├── data/              tile 索引
-│   ├── analysis/          指标分析与论文诊断
-│   ├── figures/           论文制图
-│   ├── checks/            冒烟与一致性检查
-│   └── system/            资源监控
-├── configs/               非五折配置
-├── datalists/             375/42 场景名单
-├── docs/                  数据手册、结果与整理记录
-└── paper/                 论文源码和正式插图
+floe/            模型、数据读取、损失与指标
+  models/sota/   SegFormer（含 PGSG 模块）及对比模型
+  models/legacy/ 早期 U-Net / Swin（infer.py 与旧配置仍引用）
+configs/         FLOE/：本档案；AI4Arctic/：AutoICE 基准；_base_/：公共默认值
+datalists/       cv5/：分组五折名单；ai4arctic/：AutoICE 名单与官方 MD5 清单
+tools/           train / evaluate / infer 入口，以及 data、analysis、figures、checks、system
+docs/            数据手册、计划、论文数字来源、诊断日志
+paper/           论文 LaTeX 与插图
 ```
 
-根目录只保留 `README.md`、`AGENTS.md`、`.gitignore`。所有 Python 工具从项目根目录以 `python -m tools.…` 执行，不直接用 `python tools/…py`；无需修改 `PYTHONPATH`。
+所有工具从仓库根目录以 `python -m tools.…` 运行。
 
-## 当前入口
+## 配置
 
-| 配置 | 用途 |
+| 配置 | 内容 |
 |---|---|
-| `configs/FLOE/sota_segformer_in1k_dlr_417.py` | Baseline |
-| `configs/FLOE/pgsg_evidence_gate.py` | 证据分支＋竞争门控 |
-| `configs/FLOE/pgsg.py` | 完整 PGSG，另含尺度轴 Transformer |
+| `configs/FLOE/sota_segformer_in1k_dlr_417.py` | (a) 基线：SegFormer-B2，ImageNet 初始化，编码器 0.1× 学习率 |
+| `configs/FLOE/pgsg_evidence_gate.py` | (b) 证据 + 竞争门控 |
+| `configs/FLOE/pgsg.py` | (c) 完整 PGSG（另加尺度轴 Transformer） |
+| `configs/FLOE/pgsg_gate_noevidence.py`、`pgsg_noevidence.py` | (b′)(c′) 去掉证据的结构对照 |
+| `configs/FLOE/res80_noglcm.py`、`res160_noglcm.py` | 分辨率实验：输入 80 m vs 160 m，标签与评估均在 80 m |
+| `configs/FLOE/sota_deeplabv3_in1k_dlr.py` | DeepLabV3+ R50 对比 |
+| `configs/AI4Arctic/a4a_baseline.py`、`a4a_pgsg.py` | AutoICE（AI4Arctic ready-to-train v3），仅 SAR |
 
-三个入口使用 `datalists/train_417.json`（375 景）和 `datalists/val_417.json`（42 景）。没有独立测试集；`test_path` 暂指验证名单。历史论文单折为 334/83 划分，不与此处 375/42 结果混用。
+论文实验一律逐折训练：`python -m tools.train <cfg> --fold K`，名单取 `datalists/cv5/fold{K}_{train,val}.json`。
+配置里默认的 `train_417`/`val_417` 名单只用于冒烟：42 个验证景中有 14 个与训练景属于同一 datatake 的相邻帧。
 
-## 服务器运行
-
-本地 Windows 只编辑和静态检查；Python 检查、训练、评估与推理在服务器执行。先确认实例身份、资源及 GPU 空闲，激活 `ice-binary`。新目录尚未部署到服务器，不根据旧文档猜测 SSH 端口。
-
-以下是部署后在项目根目录运行的示例，本次迁移没有执行：
+## 常用命令
 
 ```bash
-conda activate ice-binary
-python -m tools.checks.smoke_pgsg
+source tools/system/floe_env.sh                 # 数据路径、HF 镜像、离线 W&B，并激活环境
+python -m tools.checks.smoke_pgsg               # CPU，无需数据
 python -m tools.checks.smoke_pipeline configs/FLOE/pgsg.py
-python -m tools.train configs/FLOE/pgsg.py --wandb-project MyDS-FLOE --wandb-name floe_pgsg_417_s42 --work-dir work_dir/floe_pgsg_417_s42
-python -m tools.evaluate --config configs/FLOE/pgsg.py --checkpoint work_dir/floe_pgsg_417_s42/best_model_floe_pgsg_417_s42.pth --val-list datalists/val_417.json --dump-cm /root/autodl-tmp/cm/single/pgsg.npz
+python -m tools.train configs/FLOE/pgsg.py --fold 0 --seed 42 --work-dir work_dir/pgsg_f0
+python -m tools.evaluate --config configs/FLOE/pgsg.py --checkpoint work_dir/pgsg_f0/best_model_*.pth \
+    --val-list datalists/cv5/fold0_val.json --dump-cm $FLOE_CM_DIR/cv5/pgsg_s42_f0.npz
+python -m tools.analysis.paired_cv --a "$FLOE_CM_DIR/cv5/baseline_s42_f{K}.npz" \
+    --b "$FLOE_CM_DIR/cv5/pgsg_s42_f{K}.npz" --labels baseline pgsg
 ```
 
-Baseline 使用对应配置和 `floe_baseline_417_s42` run 名；CM 导出为 `/root/autodl-tmp/cm/single/baseline.npz`。辐射测试使用 `tools/analysis/radiometric.py`，显式提供配置、checkpoint、名单和 `--dump-cm /root/autodl-tmp/cm/single/radio/baseline`。完整参数以脚本为准。
+服务器上的长任务走 GPU 队列：`tools/system/run_queue.sh <queue>`（`--check` 只看状态），
+单个 run 用 `launch_fold.sh`（五折）或 `launch_run.sh`（AutoICE 等非折 run），都在 tmux 中运行并把日志写到持久盘。
 
-长训练放 tmux，重定向到持久盘日志，不用 `python ... | tee` 判断退出码。训练占卡时不启动其他 GPU 工作。
+## 数据工具
 
-## 外部资产和环境
+| 工具 | 用途 |
+|---|---|
+| `tools/data/scan_tiles.py` | 建 tile 索引（训练采样用） |
+| `tools/data/recompress.py` | 压缩副本：连续变量量化到 2⁻¹⁰ z 网格 + Blosc-zstd，标签逐位不变，逐文件核对 |
+| `tools/data/check_transfer.py` | 检查传输完整性，可逐个打开 NC |
+| `tools/data/fetch_ai4arctic.sh`、`convert_ai4arctic.py`、`prepare_ai4arctic.sh` | 下载 AutoICE 并按官方 MD5 核对，统一到本档案的辐射标准化，建名单与 tile 索引 |
+| `tools/data/folds_from_cm.py` | 由旧五折逐景 CM 恢复折名单 |
 
-- NC：`/root/autodl-tmp/FLOE_datanc/`；tile 索引：`/root/autodl-tmp/floe_tile_index_417.npz`。
-- checkpoint、CM 和大部分原始训练日志未包含在此目录，不存在已训练好的新 375/42 PGSG 成绩。
-- 制图脚本通过 `FLOE_DATA_DIR`、`FLOE_TILE_INDEX`、`FLOE_CM_DIR`、`FLOE_FIG_DIR` 配置公共路径。默认 CM 为 `/root/autodl-tmp/cm/single`。
-- 图 6 可用 `--logs` 显式指定原始训练日志。已有 `docs/figs/fig6_readouts.csv` 为历史解析数据。
-- 暗景诊断另需 `docs/_radiometric_profile_417.csv`，此资产未找到；可在服务器使用保留的统计脚本生成。
-- 依赖与验证边界见 `docs/ENVIRONMENT.md`。
+## 文档
 
-## 资料
+- `docs/PAPER_TODO.md`：当前计划与进度。
+- `docs/PAPER_NUMBERS.md`：论文中每个数字的来源。
+- `docs/DATASET_HANDBOOK.md`、`docs/dataset_distribution.md`、`docs/tile_sampling.md`：数据格式、分布与采样设计。
+- `docs/EXPERIMENT_RESULTS.md`：历史 fold-0 结果及其适用范围。
+- `docs/ENVIRONMENT.md`：服务器、目录与依赖。
+- `docs/logs/`：论文诊断实验的原始日志（只读）。
 
-- `paper/`：原样保留的正式 LaTeX 与插图。迁移未改写或编译论文。
-- `docs/EXPERIMENT_RESULTS.md`：历史指标及其适用范围。
-- `docs/PAPER_TODO.md`：论文收尾事项。
-- `docs/FLOE_Git_TRANSFER_MANIFEST.md`：转移前批准清单，保留为计划快照。
-- `docs/TRANSFER_REPORT.md`、`docs/TRANSFER_FILES.csv`、`docs/TRANSFER_SHA256.csv`：实际转移记录、源文件对照与最终校验。
+## 许可
 
-上述 TRANSFER 文件是首次转移时的历史快照，记录旧目录布局。当前路径以 `docs/LAYOUT_FILES.csv` 为准，当前校验见 `docs/LAYOUT_SHA256.csv`，目录调整说明见 `docs/DIRECTORY_LAYOUT.md`。数据手册在 `docs/DATASET_HANDBOOK.md`。
-
-历史文档可能引用未转移的五折文件或旧服务器路径，仅用于追溯论文依据，不是本目录可执行指令。
-
-## 开源许可
-
-本仓库采用 MIT 许可证，见 [LICENSE](LICENSE)。已有第三方代码的版权声明应予保留，外部依赖、数据及预训练权重按各自许可使用。开源此代码库不代表发布外部数据集或模型权重。
+MIT，见 [LICENSE](LICENSE)。`floe/functions.py` 等文件源自滑铁卢大学的 AutoICE 工具包，保留其作者信息。
+外部数据（Sentinel-1、冰图、AI4Arctic，CC BY 4.0）与预训练权重按各自许可使用。

@@ -176,3 +176,15 @@ uint8，取值 **0–6 为类别，255 为忽略(ignore)**：
 | glcm_sigma0_hh_homogeneity | 0.6907 | 0.3150 |
 
 （统计像元数 count ≈ 1.43×10¹⁰，为全体样本有效像元。）
+
+
+---
+
+## 11. 压缩副本（2026-11-10，训练默认读取）
+
+- 位置：服务器 `/root/autodl-tmp/WannianLi/FLOE/data_q10/`（原始文件保留在 `Data/FLOE_datanc/`，未改动）。生成：`tools/data/recompress.py`（`tools/system/compress_loop.sh` 随传输逐景转换）。
+- 连续通道（HH、HV、入射角、3 个 GLCM，z-score float32）取整到 2⁻¹⁰ z 单位的网格，仍为 float32；最大误差 q/2 = 4.9×10⁻⁴ z，即 HH 0.004 dB、HV 0.005 dB、入射角 0.004°、GLCM contrast 0.037、dissimilarity 0.002、homogeneity 0.0002。零值模式逐位保留（无效像元仍为 0；落入 ±q/2 的少量有效像元保留原值）。
+- FLOE 标签与 global_valid_mask 逐位相同；形状、dtype、512×512 chunk、全部属性与维度坐标不变 ⇒ `floe_tile_index_417.npz` 继续有效。
+- 编码：Blosc-zstd（level 5）+ bit-shuffle。读取需 `import hdf5plugin`（仓库读取路径均已导入；不要同时设置 `HDF5_PLUGIN_PATH`）。
+- 实测（12 景试转换）：10.4 GB → 4.3 GB（2.41×）；chunk 解码 5.3 → ~2 ms/变量；训练 batch 载入快约 1.2×；同种子下训练 batch 标签完全相同，输入差 ≤ q/2（派生极化通道 ≤ q）。每个输出文件在落盘前与源文件逐变量核对。
+- 无损重编码（zstd+bit-shuffle）体积不变（浮点尾数为噪声）；2⁻⁸ 网格可到约 3.1×，误差 0.016 dB（HH），未采用。
