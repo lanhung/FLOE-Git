@@ -1,6 +1,10 @@
+import os
 from floe.functions import f1_metric, r2_metric
+
+# Data location: override with FLOE_DATA_DIR (same variable as tools/figures/common.py).
+FLOE_DATA_DIR = os.path.join(os.environ.get('FLOE_DATA_DIR', '/root/autodl-tmp/FLOE_datanc'), '')
 import torch.nn as nn
-# Charts in the dataset
+
 CHARTS = ['FLOE']
 
 
@@ -47,7 +51,6 @@ SIC_LOOKUP = {
 SOD_LOOKUP = {
     'sod_partial_idx': [3, 6, 9],  # Partial SIC polygon code index. SA, SB, SC.
     'threshold': 0.7,  # < 1. Minimum partial percentage SIC of total SIC to select SOD. Otherwise ambiguous polygon.
-                       # larger than threshold.
     'invalid': -9,  # Value for polygons where the SOD is ambiguous or not filled.
     'water': 0,
     0: 0,
@@ -57,7 +60,7 @@ SOD_LOOKUP = {
     83: 1,  # Young ice       → 合并入新冰/幼冰类(1)
     84: 1,  # Grey ice        → 合并入新冰/幼冰类(1)
     85: 1,  # White ice       → 合并入新冰/幼冰类(1)
-    86: 3,  # First-year ice, overall categary
+    86: 3,  # First-year ice, overall category
     87: 2,  # Thin first-year ice
     88: 2,  # Thin first-year ice, stage 1
     89: 2,  # Thin first-year ice, stage 2
@@ -85,19 +88,17 @@ FLOE_LOOKUP = {
     3: 2,  # Small floe
     4: 3,  # Medium floe
     5: 4,  # Big floe
-    6: 5,  # Vast flpe
-    7: 5,  # Gian floe
+    6: 5,  # Vast floe
+    7: 5,  # Giant floe
     8: 255,  # Fast ice
     9: 255,  # Growlers, floebergs or floebits → 忽略（样本极少）
     10: 255,  # Icebergs → 忽略（样本极少）
     21: 255,  # Level ice
     'fastice_class': 255,
     'mask': 255,
-    # 类别方案（与 DATASET_HANDBOOK.md §4 一致）：
-    # 0=水体, 1=饼状冰(ice cake; 2026-07-16 数据集扩充后有像素, 此前为空),
-    # 2=小浮冰, 3=中浮冰, 4=大浮冰, 5=巨浮冰
-    # 数据集标签 6(冰山类, 本数据集无) 在读取时重映射为 255 忽略。
-    'berg_class': 6,  # .nc 中的冰山标签值，loader 读取时置为 mask(255)
+    # 类别方案（见 docs/DATASET_HANDBOOK.md §4）：
+    # 0=水体, 1=饼状冰(ice cake), 2=小浮冰, 3=中浮冰, 4=大浮冰, 5=巨浮冰
+    'berg_class': 6,  # .nc 中的冰山标签值（本数据集无），loader 读取时置为 mask(255)
     'n_classes': 6
 }
 
@@ -106,16 +107,14 @@ train_options = {
     # -- Random Seed -- #
     'seed': -1,
     # -- Training options -- #
-    # FLOE 数据集（已 z-score 归一化，见 DATASET_HANDBOOK.md）
-    'path_to_train_data': '/root/autodl-tmp/FLOE_datanc/',
-    'path_to_test_data': '/root/autodl-tmp/FLOE_datanc/',
+    # FLOE 数据集（已 z-score 归一化，见 docs/DATASET_HANDBOOK.md §8）
+    'path_to_train_data': FLOE_DATA_DIR,
+    'path_to_test_data': FLOE_DATA_DIR,
 
-
-    # 暂无独立测试集：test_path 先占位指向 val_files.json（启动时仅被读入，训练循环不使用 test_list）
+    # 无独立测试集：test_path 只在启动时被读入，训练循环不使用 test_list。
     'train_list_path': 'datalists/train_417.json',
     'val_path': 'datalists/val_417.json',
     'test_path': 'datalists/val_417.json',
-
 
     'path_to_env': './',
 
@@ -135,20 +134,15 @@ train_options = {
     # -- 目标任务与选模标准 -- #
     'target_chart': 'FLOE',
     'model_save_criterion': 'miou',  # best model 按 val mIoU 保存
-    
+
     # p leave out cross val run
     'cross_val_run': False,
     'p-out': 20,
     'compute_classwise_f1score': False,
     'plot_confusion_matrix': False,
 
-    # If true it compiles the model. This will increase the speed of the model for training and inference. 
-    # Needs Pytorch 2 to work.
+    # torch.compile the model (PyTorch 2).
     'compile_model': False,
-    
-    # ensemble after softmax?
-    # 'ensemble_after_softmax': True,
-    # TODO: Speak with Muhammed different quickstart.py should have different configs.
 
     # -- loss options -- #
     'chart_loss': {  # Loss for the task
@@ -166,75 +160,10 @@ train_options = {
 
         },
     },
-    # Having the following paramter greater than zero adds a new loss that penilizies inconsitent
-    # water logits across the three outputs (SIC, SOD, FLOE)
+    # > 0 adds a loss penalising inconsistent water logits across the SIC/SOD/FLOE outputs.
     "edge_consistency_loss": 0,
-    # refer this link for more parameters related to loss :
+    # Other loss 'type's and their parameters: floe.functions.get_loss, floe/losses.py and
     # https://github.com/qubvel/segmentation_models.pytorch/tree/master/segmentation_models_pytorch/losses
-
-    # some losses are defined locally in the losses.py file, refer them to see more
-    # about the parameters required
-
-
-    # # Binary cross entropy loss
-    #     'type': 'BinaryCrossEntropyLoss',
-
-    # # Focal Loss
-    #     'type': 'FocalLoss',
-    #     'mode': 'multiclass',
-    #     'gamma': 0.7,
-    #     'ignore_index': 255
-
-    # # Dice Loss
-    #     'type': 'DiceLoss', --> Not working
-    #     'mode': 'multiclass',
-    #     'ignore_index': 255
-
-    # # Jaccard Loss --> Not working
-    #     'type': 'JaccardLoss',
-    #     'mode': 'multiclass',
-
-    # # LovaszLoss Loss
-    #     'type': 'LovaszLoss',
-    #     'mode': 'multiclass',
-    #     'ignore_index': 255
-
-    # # SoftBCEWithLogitsLoss Loss
-    #     'type': 'SoftBCEWithLogitsLoss',
-    #     'ignore_index': 255,
-    #     'smooth_factor': 0,
-
-    # # SoftCrossEntropyLoss --> NOT WORKING
-    #     'type': 'SoftCrossEntropyLoss',
-    #     'ignore_index': 255,
-    #     'smooth_factor': 0.1,
-
-    # # TverskyLoss
-    #     'type': 'TverskyLoss',
-    #     'ignore_index': 255,
-    #     'mode': 'multiclass',
-    #     'smooth': 0,
-
-    # # MCC Loss --> NOT WORKING
-    #     'type': 'MCCLoss',
-    #     'eps': 1e-5
-
-    # CrossEntropyLoss from Pytorch
-    #     'type': 'CrossEntropyLoss',
-    #     'ignore_index': 255,
-
-    # # BinaryCrossEntropyLoss from Pytorch --> Not working
-    #     'type': 'BCELoss',
-    #     'ignore_index': 255,
-    #     #  'smooth_factor': 0.1,
-
-    # OrderedCrossEntropyLoss
-    #     'type': 'OrderedCrossEntropyLoss',
-    #     'ignore_index': 255,
-
-    # MSELossFromLogits
-    #     'type': 'MSELossFromLogits',
-    #     'ignore_index': 255,
 
     # If true accuracy will be calculated using binary classification between water and ice first
     "binary_water_classifier": False,
@@ -249,41 +178,13 @@ train_options = {
         'b2': 0.999,
         'weight_decay': 0.0
     },
+    # Also supported: 'AdamW', 'SGD' (floe.functions.get_optimizer).
 
-    # 'optimizer': {
-    #     'type': 'AdamW',
-    #     'lr': 0.0001,  # Optimizer learning rate.
-    #     'b1': 0.9,
-    #     'b2': 0.999,
-    #     'weight_decay': 0.01
-    # },
-
-    # 'optimizer': {
-    #     'type': 'SGD',
-    #     'lr': 0.0001,  # Optimizer learning rate.
-    #     'momentum': 0,
-    #     'dampening': 0,
-    #     'nesterov': False,
-    #     'weight_decay': 0.01
-    # },
-
+    # Also supported: 'CosineAnnealingLR', 'CosineAnnealingWarmRestartsLR', 'ReduceLROnPlateau'
+    # (floe.functions.get_scheduler).
     'scheduler': {'type': None},
 
-    # 'scheduler': {
-    # '_delete_': True,
-    #     'type': 'CosineAnnealingLR',  # Name of the schedulers
-    #     'lr_min': 0,  # Minimun learning rate
-    # },
-
-    # 'scheduler': {
-    # '_delete_': True,
-    #     'type': 'CosineAnnealingWarmRestartsLR',  # Name of the schedulers
-    #     'EpochsPerRestart': 20,  # Number of epochs for the first restart
-    #     'RestartMult': 1,  # This number will be used to increase or descrase the number of epochs to restart after each restart.
-    #     'lr_min': 0,  # Minimun learning rate
-    # },
-
-    # -- Data prepraration lookups and metrics.
+    # -- Data preparation lookups and metrics.
     # Contains the relevant variables in the scenes.
     'train_variables': SCENE_VARIABLES,
     'charts': CHARTS,  # Charts to train on.
@@ -292,16 +193,15 @@ train_options = {
         'SOD': SOD_LOOKUP['n_classes'],
         'FLOE': FLOE_LOOKUP['n_classes']
     },
-    # Minimum ratio of valid (non-black-border) pixels in a training patch.
-    # Patches with valid_ratio < valid_mask_threshold will be discarded during training.
-    'valid_mask_threshold': 0.5,  # 控制黑边丢弃阈值
+    # Training patches with a smaller fraction of valid (non-black-border) pixels are discarded.
+    'valid_mask_threshold': 0.5,
 
     # Patch sampling log mode (requires num_workers=0):
     #   'per_epoch' : 每epoch一行，记录该epoch所有patch的SOD像素总计（推荐）
     #   'per_patch' : 每patch一行，记录单个patch的SOD像素分布及来源文件名
     'patch_log_mode': 'per_epoch',
 
-    # SAR pixel spacing. 80m for MyDS dataset.
+    # SAR pixel spacing in metres.
     'pixel_spacing': 80,
     'train_fill_value': 0,  # Mask value for SAR training data.
     'class_fill_values': {  # Mask value for class/reference data.
@@ -334,17 +234,13 @@ train_options = {
     'num_workers_val': 0,  # Number of parallel processes during validation.
     'prefetch_factor': 2,  # Batches to prefetch per worker (requires num_workers > 0).
 
-
-    # ⚠️ 两阶段采样配置——当前【未实装】：以下 key 在 loaders.py 中无任何消费点，纯占位不生效。
-    # FLOE 水/冰极不平衡（~90% 水 + 全图 2/3 为 255，手册 §5），均匀随机裁 patch 会几乎采不到冰，
-    # 采样策略（实装两阶段 / water_rejection / rare_samplers）待定，见 CLAUDE.md 待办。
-    'two_phase_sampling': True,           # 未实装，无效
-    'base_ratio': 0.6,                    # 未实装，无效
-    # 各类别目标像素占比，长度 = FLOE n_classes(6)：水/饼冰(无)/小/中/大/巨
+    # 以下两阶段采样 key 没有任何代码读取（类别均衡由 tile_sampling 负责，
+    # 见 configs/FLOE/_sota_base.py），仅为兼容旧 config 保留。
+    'two_phase_sampling': True,
+    'base_ratio': 0.6,
     'target_class_ratio': [0.2, 0.0, 0.2, 0.2, 0.2, 0.2],
-    'class_bank_stride_factor': 0.5,      # 扫描步长 = patch_size × factor，默认 0.5
-    'phase2_max_retries': 20,             # Phase 2 每个 slot 最大重试次数，默认 20
-
+    'class_bank_stride_factor': 0.5,
+    'phase2_max_retries': 20,
 
     # -- U-Net Options -- #
     'unet_dropout': 0.0,  # Dropout probability applied after each DoubleConv block (0.0 = disabled).
@@ -382,8 +278,7 @@ train_options = {
     'backbone': 'unet',
 
     # -- Model selection -- #
-    'model_selection': 'unet',  # Either 'swin', 'unet, or Separate_decoder
-
+    'model_selection': 'unet',  # all options: floe.functions.get_model
 
     # -- Data Augmentation Options -- #
     # Random_h_flip (float, [0, 1]) - Chance of doing random horizontal flip

@@ -1,12 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""全库辐射侧写（2026-08-08，CPU-only）：每景抽若干 tile 算 HH（nersc_sar_primary）
-有效像元的 mean/std（z-unit），回答"暗景/异常对比度景在 train 里是否欠代表"。
-
-背景：08-04 逐景分解把 medium 失效点名到暗景（HH 均值比优等景低 0.7~0.9 z）与异常
-对比度景（20240624 HH std 1.32 vs 典型 0.55-0.8）；补数据前先确认这些条件在 train
-里的覆盖密度。tile 坐标来自 tile 索引（chunk 对齐、只挑 label_valid_ratio 高的），
-每景 ~4 tile，与 08-04 的 6-chunk 抽样同族（±0.1 量级噪声）。
+"""全库 HH 辐射侧写（CPU-only）：每景从 tile 索引取 label_valid_ratio 最高的若干 tile，算 HH
+有效像元的 mean/std（z-unit），看暗景与异常对比度景在 train 里是否欠代表。
+逐景结果写到 docs/_radiometric_profile_417.csv（tools.analysis.darkscenes 读它）。
 
 用法: python -m tools.analysis.radiometric_profile [--tiles-per-scene 4]
 """
@@ -15,14 +11,19 @@ import json
 import os
 import os.path as osp
 
+# 必须在 import numpy 之前设置
 for _v in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS'):
     os.environ.setdefault(_v, '2')
 
 import h5py
+try:
+    import hdf5plugin  # noqa: F401  registers Blosc/zstd filters (tools.data.recompress output)
+except ImportError:
+    hdf5plugin = None
 import numpy as np
 
-DATA_DIR = '/root/autodl-tmp/FLOE_datanc'
-INDEX = '/root/autodl-tmp/floe_tile_index_417.npz'
+DATA_DIR = os.environ.get('FLOE_DATA_DIR', '/root/autodl-tmp/FLOE_datanc')
+INDEX = os.environ.get('FLOE_TILE_INDEX', '/root/autodl-tmp/floe_tile_index_417.npz')
 HH_VAR = 'nersc_sar_primary'
 
 

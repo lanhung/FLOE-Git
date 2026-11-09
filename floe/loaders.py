@@ -1,13 +1,24 @@
+"""Datasets for FLOE scenes (HDF5/NetCDF, 80 m grid).
+
+AI4ArcticChallengeDataset yields whole training batches of random patches, drawn from
+chunk-aligned tiles weighted to a target pixel class mix (tile index built by
+tools/data/scan_tiles.py). AI4ArcticChallengeTestDataset yields whole validation/test
+scenes, optionally reading only the chunks that contain valid labels.
+"""
 # -- Built-in modules -- #
 import os
-import os.path as osp
-import csv
 import math
 from collections import OrderedDict
 from tqdm import tqdm
 
 # -- Third-party modules -- #
 import h5py
+# hdf5plugin registers the Blosc/zstd filters on import; only scenes re-encoded with
+# `tools.data.recompress --codec zstd` need it.
+try:
+    import hdf5plugin  # noqa: F401
+except ImportError:
+    hdf5plugin = None
 import numpy as np
 import torch
 import xarray as xr
@@ -19,49 +30,36 @@ from scipy.ndimage import binary_erosion as _scipy_binary_erosion
 from floe.functions import rand_bbox
 
 
-# Global LRU cache for pre-downsampled training scenes, bounded by byte size
-# (see _get_or_create_cached_scene). Keyed by (data_root, filename, scale/options),
-# value stores CPU tensors. OrderedDict so move_to_end()/popitem(last=False) give O(1) LRU.
+# Byte-bounded LRU cache of decoded scenes for the legacy (non-tile) sampler,
+# keyed by _scene_cache_key; values are CPU tensors.
 _SCENE_CACHE = OrderedDict()
 _SCENE_CACHE_BYTES = 0
-# 40GB，此值为【跨所有 DataLoader worker 的总预算】（见 _effective_scene_cache_max_bytes），
-# 按容器可用内存在 config 的 scene_cache_max_bytes 里覆盖。
+# 跨所有 DataLoader worker 的总预算（见 _effective_scene_cache_max_bytes），
+# 可在 config 的 scene_cache_max_bytes 里按容器内存覆盖。
 _DEFAULT_SCENE_CACHE_MAX_BYTES = 40 * 1024 ** 3
 
 
-# ---------------------------------------------------------------------------
-# Tile 采样（2026-07-09 引入，取代整景解码 + 随机裁 + 概率拒绝的旧路径）
-#
-# .nc 底层 HDF5 的二维变量是 chunks=(512,512)+gzip4 存储的，可以只解压覆盖到的 chunk。
-# 实测：读一个 chunk 对齐的 512×512 tile（8 个变量）约 27ms，而 xarray 整景解码约
-# 9.2s/景（输出 2.8~3.1GB float32，正是 OOM 的来源）。按 patches_per_tile=2 折算，
-# 每 patch 约 13.5ms，对比旧路径每 patch 摊 ~1.53s（缓存命中率约 1%）。
-#
-# 同时 scan_tiles.py 的全量统计显示：全图 69.7% 的像元是 255（黑边+陆地，在 loss 里被
-# ignore_index 屏蔽，梯度贡献恒为 0），按 512 对齐切 tile 后 56.4% 的 tile 是"全无效"
-# （没有任何一个像元能参与 loss）。这些 tile 被 scan_tiles.py 从索引里剔除，训练时永远
-# 不会被读到。剩下的 tile 按类别直方图加权采样，接受率 100%，不再需要任何概率拒绝重试。
-# ---------------------------------------------------------------------------
+# Tile 采样：.nc 底层 HDF5 的二维变量按 chunks=(512,512)+gzip 存储，读一个 chunk 对齐的
+# 512×512 tile 时每个变量只解压一个 chunk（8 个变量约 27ms），而 xarray 整景解码约 9s/景、
+# 输出约 3GB float32。不含任何有效标签像元的 tile 已被 scan_tiles.py 从索引中剔除，其余
+# tile 按类别直方图加权抽取（_solve_tile_weights），因此不需要拒绝采样。
 
-# 每个进程独立的 HDF5 句柄 LRU。句柄本身只占几 KB，缓存它是为了省掉重复 open 的
-# ~10ms 以及 chunk cache 的重建。
+# 每个进程独立的 HDF5 句柄 LRU。句柄只占几 KB，缓存它是为了省掉重复 open 的约 10ms
+# 以及 chunk cache 的重建。
 _H5_HANDLES = OrderedDict()
 _H5_HANDLES_PID = None
 _H5_MAX_OPEN = 16
-# HDF5 的 chunk cache 默认只有 1MB，装不下一个 512×512 float32 chunk（1MB）——
-# 同一 tile 的多个变量/多次 crop 会反复解压同一个 chunk。给到 64MB 足够放下
-# 一个 tile 的全部 8 个 chunk。
+# HDF5 的 chunk cache 默认只有 1MB，装不下一个 512×512 float32 chunk，同一 tile 的多个
+# 变量会反复解压同一个 chunk。64MB 足够放下一个 tile 的全部 8 个 chunk。
 _H5_RDCC_NBYTES = 64 * 1024 ** 2
 
 
 def _get_h5_handle(path):
-    """按进程缓存打开的 HDF5 句柄。
+    """按进程缓存打开的 HDF5 句柄（LRU，最多 _H5_MAX_OPEN 个）。
 
-    HDF5 库在 fork 之后使用继承来的句柄是未定义行为（父子共享同一个文件描述符的偏移
-    和 chunk cache，并发读会读到错乱数据）。本函数只在 DataLoader worker 里被首次调用
-    （__getitem__ 内），父进程从不打开文件，所以正常路径下不存在继承句柄；下面的 pid
-    校验只是安全网：一旦发现当前 pid 与建表时不同，就丢弃整张表在本进程重新打开。
-    直接 clear() 而不 close()：fork 后子进程的 fd 是独立的，GC 关掉子进程这份不会影响父进程。
+    fork 之后沿用继承来的 HDF5 句柄是未定义行为。文件只在 DataLoader worker 里打开，
+    pid 校验只是安全网：pid 与建表时不同就丢弃整张表重新打开。只 clear() 不 close()：
+    fork 后子进程的 fd 是独立副本，关闭它不影响父进程。
     """
     global _H5_HANDLES_PID
     pid = os.getpid()
@@ -88,9 +86,8 @@ def _get_h5_handle(path):
 def cpu_quota():
     """容器实际可用的 CPU 核数（cgroup 配额），而不是宿主机核数。
 
-    `nproc` / `os.cpu_count()` 在 AutoDL 容器里报的是宿主机核数（实测 208），
-    真正的限制在 cgroup 的 cpu.max 里（实测 2500000/100000 = 25 核）。
-    这和 `free -h` 报宿主机内存、真正的限制在 memory.max 里是同一类陷阱。
+    容器里 `nproc` / `os.cpu_count()` 报的是宿主机核数（例如配额 25 核时报 208），
+    真正的限制在 cgroup 的 cpu.max（v2）或 cpu.cfs_quota_us（v1）里。
     """
     try:
         with open('/sys/fs/cgroup/cpu.max') as f:          # cgroup v2
@@ -117,13 +114,10 @@ _THREADS_LIMITED = False
 def limit_torch_threads():
     """把 torch 的 intraop 线程数收到与 cgroup CPU 配额相称的水平。
 
-    torch 按 `nproc`（宿主机 208 核）建 intraop 线程池，而容器只有 25 核的配额，于是
-    每个并行算子都在做严重超订的线程同步。2026-07-09 实测这不是"慢一点"而是灾难性的：
-    一次 7×256×256 的 float32 cast 要 3.3 秒（正常是微秒级），一个 batch 的组装从
-    0.55 秒膨胀到 205 秒（373 倍）。numpy 的 astype 也被这些自旋线程挤慢 170 倍。
-
-    DataLoader worker 本身已经是进程级并行，每个 worker 再开多线程只会互相踩踏，设成 1。
-    主进程留少量线程给 CPU 侧算子（collate、验证时在 CPU 上攒预测等）。
+    torch 按宿主机核数建 intraop 线程池；配额远小于此时每个并行算子都在做超订的线程
+    同步，CPU 侧算子会慢几百倍（一个 batch 的组装从 0.55s 变成 205s）。DataLoader worker
+    已是进程级并行，每个 worker 设 1 线程；主进程最多 8 线程，留给 collate、验证时在 CPU
+    上累计预测等。
     """
     global _THREADS_LIMITED
     if _THREADS_LIMITED:
@@ -133,35 +127,29 @@ def limit_torch_threads():
 
 
 def _solve_tile_weights(hist, target, iters=400, eta=0.5):
-    """求每个 tile 的采样概率，使训练实际看到的【像素】类别分布逼近 target。
+    """求每个 tile 的采样概率，使训练实际看到的像素类别分布逼近 target。
 
-    权重族取 w_i ∝ Σ_c a_c · frac[i, c]（frac 是 tile 内各类归一化占比，尺度无关），
-    对 a 做乘法更新（RAS / IPF 式迭代）：每轮算出当前期望像素分布 p，
-    再把 a_c 乘以 (target_c / p_c)^eta。target 落在 {frac[i]} 的凸包内时收敛。
+    权重族取 w_i ∝ Σ_c a_c · frac[i, c]（frac 是 tile 内各类的归一化占比），对 a 做乘法
+    更新（IPF 式）：每轮算出当前期望像素分布 p，把 a_c 乘以 (target_c / p_c)^eta。
+    target 落在 {frac[i]} 的凸包内时收敛。
 
-    **期望像素分布必须按像素数加权，不能取各 tile 归一化占比的平均**：
-        p = (Σ_i w_i · hist[i]) / Σ_i Σ_c w_i · hist[i, c]      ← 正确
-        p = Σ_i w_i · frac[i]                                    ← 错误（首版如此）
-    两者只在所有 tile 的有效像元数相等时才一致。tile 的有效像元数差异很大（有的一半是
-    陆地/黑边），2026-07-09 实测首版的错误口径让求解器自以为命中了 target，实际分布却
-    偏出 ±0.02。
+    期望像素分布按像素数加权，p = Σ_i w_i·hist[i] / Σ_i Σ_c w_i·hist[i, c]，而不是各 tile
+    占比的平均 Σ_i w_i·frac[i]：tile 的有效像元数差异很大，后者会偏出约 ±0.02。
+    hist 应传 scan_tiles.py 里按裁剪覆盖核加权的 hist_w：patch 在 tile 内随机裁，tile
+    中心的像素比边缘更容易被采到，用原始直方图会再偏约 ±0.015。
 
-    传进来的 hist 应该是 scan_tiles.py 里【按裁剪覆盖核加权】的 hist_w：训练是在 tile 内
-    随机裁 patch，tile 中心的像素比边缘更容易被采到，用原始直方图求解会再偏 ±0.015。
-
-    之所以不能直接"按类别稀有度的倒数配权重"：big/vast 的像素总量和 small/medium 相当，
-    但只分布在约 1/3 的 tile 数量上（大浮冰是大块连续的，小/中浮冰是散布的），
-    因此 tile 级的均匀加权会系统性地压低 big/vast 的像素份额。
+    不直接按类别稀有度的倒数配权重：big/vast 的像素总量与 small/medium 相当，但只分布在
+    约 1/3 的 tile 上（大浮冰成片连续），tile 级的均匀加权会系统性压低它们的像素份额。
 
     Parameters
     ----------
-    hist : (N, C) float64  每个 tile 各类别的（核加权）像素数，255 已排除
-    target : (C,) float64  目标像素占比，行和为 1；某类为 0 表示不参与（如当前数据里不存在的类）
+    hist : (N, C) float64  每个 tile 各类别的（核加权）像素数，不含 255
+    target : (C,) float64  目标像素占比，和为 1；为 0 的类不参与
 
     Returns
     -------
     w : (N,) float64  归一化的 tile 采样概率
-    achieved : (C,) float64  该权重下的期望像素分布（供调用方与 target 核对）
+    achieved : (C,) float64  该权重下的期望像素分布
     """
     frac = hist / np.maximum(hist.sum(axis=1, keepdims=True), 1e-12)
     active = target > 0
@@ -214,13 +202,8 @@ def _scene_cache_key(options, file):
 
 def _load_downsampled_scene(options, file, n_charts_init, cls2_mask_dir):
     """Load one scene, downsample/pad once, and return tensors ready for random crops."""
-    # 2026-07-09 吞吐修复：原生分辨率下重新解析 .nc（NetCDF 解压 + xarray 拼接多个
-    # 变量/GLCM 通道）是训练吞吐的主要瓶颈，单景约 9~10 秒；缓存受内存上限约束只能
-    # 装下 288 景里的一小部分，200 epoch 训练里绝大多数请求都要重新走这条慢路径。
-    # 若 preprocess_scenes.py 已经把该场景转成 .npz（labels=uint8/feats=float16，
-    # 原生分辨率、已跳过慢的 NetCDF 解析步骤），优先读这个；数值上与直接解析 .nc
-    # 完全一致，只是跳过了慢的那一步。未预处理/未配置目录时回退到原始 .nc 解析路径
-    # （保持向后兼容，SOD 等未预处理的数据集仍可正常工作）。
+    # preprocessed_data_dir 下若有该景的 .npz（原生分辨率，labels=uint8, feats=float16），
+    # 直接读它，跳过约 9s/景的 NetCDF 解码；否则解析原始 .nc。
     preproc_dir = options.get('preprocessed_data_dir', None)
     preproc_path = (os.path.join(preproc_dir, file.replace('.nc', '.npz'))
                      if preproc_dir is not None else None)
@@ -238,11 +221,8 @@ def _load_downsampled_scene(options, file, n_charts_init, cls2_mask_dir):
             temp_scene = scene[options['full_variables']].to_array()
             temp_scene = torch.from_numpy(np.expand_dims(temp_scene, 0))
 
-    # down_sample_scale=1 时输出尺寸与输入完全相同，interpolate 是纯粹浪费——额外
-    # 分配一份满尺寸临时张量、还要做插值计算。原生分辨率(FLOE)下单景可达 150M+
-    # 像素，这份瞬时峰值内存是多 worker 并发解码时导致 OOM 的重要原因之一
-    # （2026-07-09 复盘：即使有字节预算 LRU，稳态缓存达标后仍会在并发解码时被
-    # 瞬时峰值顶爆），故 scale=1 时直接跳过，非 1 时行为不变。
+    # scale=1 时跳过 interpolate：它会额外分配一份满尺寸临时张量（原生分辨率下单景可达
+    # 150M+ 像素），这份瞬时峰值是多 worker 并发解码时 OOM 的主要来源之一。
     if options['down_sample_scale'] != 1:
         temp_scene = torch.nn.functional.interpolate(
             temp_scene,
@@ -315,12 +295,10 @@ def _payload_nbytes(payload):
 
 
 def _effective_scene_cache_max_bytes(options):
-    """把配置里的 scene_cache_max_bytes 视为【跨所有 worker 的总预算】，而不是每个
-    worker 各自的预算。PyTorch DataLoader 的 worker 是 fork 出的独立进程，每个 worker
-    有自己独立的 _SCENE_CACHE/_SCENE_CACHE_BYTES 全局状态（互不共享）——如果直接把配置
-    值当成"每个 worker 的预算"，num_workers=12 时实际峰值会是 12×配置值，完全达不到
-    限制内存的目的（2026-07-06 OOM 复盘：第一版修复正是漏了这一步，12 个 worker 各自
-    缓存到 35GB，合计 420GB，照样会被 cgroup OOM killer 杀掉）。
+    """本 worker 的缓存预算：scene_cache_max_bytes 是跨所有 DataLoader worker 的总预算。
+
+    每个 worker 是 fork 出的独立进程、各有一份 _SCENE_CACHE，若把配置值当作每个 worker
+    的预算，实际峰值会是 num_workers 倍。
     """
     max_bytes = options.get('scene_cache_max_bytes', _DEFAULT_SCENE_CACHE_MAX_BYTES)
     worker_info = get_worker_info()
@@ -340,9 +318,7 @@ def _get_or_create_cached_scene(options, file, n_charts_init, cls2_mask_dir, ena
     if enable_cache:
         payload_bytes = _payload_nbytes(payload)
         max_bytes = _effective_scene_cache_max_bytes(options)
-        # 淘汰最久未用的场景，直到腾出空间。原生分辨率(down_sample_scale=1)下单个场景
-        # 可达 1~2GB，全量缓存几百个场景会远超容器内存上限（2026-07-06 OOM 崩溃教训），
-        # 故按字节预算做 LRU 淘汰，而不是无限增长。
+        # 按字节预算淘汰最久未用的场景：原生分辨率下单景可达 1~2GB，不设上限会超出容器内存。
         while _SCENE_CACHE and (_SCENE_CACHE_BYTES + payload_bytes) > max_bytes:
             _, evicted = _SCENE_CACHE.popitem(last=False)
             _SCENE_CACHE_BYTES -= _payload_nbytes(evicted)
@@ -352,16 +328,7 @@ def _get_or_create_cached_scene(options, file, n_charts_init, cls2_mask_dir, ena
 
 
 def preload_scene_cache(options, files):
-    """Preload a file list into the global scene cache (called once before CV loop)."""
-    if options['down_sample_scale'] == 1:
-        # Keep behavior consistent with dataset implementation.
-        downsample = True
-    else:
-        downsample = True
-
-    if not downsample:
-        return
-
+    """Preload a file list into the global scene cache (called once before the CV loop)."""
     unique_files = sorted(set(files))
     if len(unique_files) == 0:
         return
@@ -384,25 +351,17 @@ def preload_scene_cache(options, files):
           f'hits={cache_hits}, misses={cache_misses}, cache_size={len(_SCENE_CACHE)}')
 
 
-def clear_scene_cache():
-    global _SCENE_CACHE_BYTES
-    _SCENE_CACHE.clear()
-    _SCENE_CACHE_BYTES = 0
-
-
 FLOE_CLASS_NAMES = ['water', 'cake', 'small', 'medium', 'big', 'vast']
 
 
 def remap_floe_labels(arr, merge_map=None, ignore_val=255):
-    """FLOE 标签重映射（就地）。所有读标签的路径都必须走这里，训练和验证口径才一致。
+    """FLOE 标签重映射（就地），训练与验证的所有标签读取都走这里。
 
-    1) 冰山(6) → 255：本数据集中该类为空，但安全网保留（DATASET_HANDBOOK §4）。
-    2) 按 merge_map 合并类别，例如 {3: 2, 4: 3, 5: 4} 把【中浮冰并入小浮冰】，
-       大/巨各降一位 → 0=水 1=饼状 2=小+中 3=大 4=巨，n_classes=5。
+    1) 冰山(6) → 255（本数据集中该类为空，保留作安全网，见 DATASET_HANDBOOK §4）。
+    2) 按 merge_map 合并类别，例如 {3: 2, 4: 3, 5: 4} 把中浮冰并入小浮冰、大/巨各降一位
+       (0=水 1=饼状 2=小+中 3=大 4=巨，n_classes=5)。
 
-    ⚠️ 合并【必须同时完成】，不能顺序 in-place。若字典迭代顺序是 5→4 再 4→3，
-    原本是 5 的像素会先变成 4、再被第二步二次映射成 3，静默串链。这里先把所有掩膜
-    从原数组读出来，再统一写回，保证原子性。
+    所有掩膜先从原数组算出再统一写回：逐项就地映射会串链（5→4 之后又被 4→3 改成 3）。
     """
     arr[arr == 6] = ignore_val
     if not merge_map:
@@ -414,21 +373,15 @@ def remap_floe_labels(arr, merge_map=None, ignore_val=255):
 
 
 def val_ondemand_ok(options, n_models=1):
-    """这个 config 的验证路径能不能安全启用「按需读」。返回 (bool, 原因字符串)。
+    """验证路径能否安全启用按需读。返回 (bool, 原因字符串)。
 
-    按需读只解码「含有效标签的 tile 所覆盖的 chunk」，其余留 0。**这要求消费者只在那些
-    tile 上做前向**，也就是推理必须走与 patch 网格对齐的不重叠 tile（
-    `functions.fast_tiled_val_predict` / `fast_tiled_val_inference` + tile 门控）。任何会
-    读到别处像素的用法都必须走整景读，否则会静默读到 0、且不会有任何报错：
-      - **重叠滑窗**（`batched_slide_inference`）：窗口位置由 `swin_hp.val_stride` 决定，
-        `configs/_base_/base.py` 的默认值是 [56,56]，只有 `sota_swin.py` 覆盖成
-        [256,256] 才恰好与 tile 网格重合。新的 swin 系 config 忘了覆盖就会踩。
-      - **翻转/偏移 TTA**（`_eval_tta.py`）：整景翻转或 pad 128 之后 tile 网格整体错位。
-      - **整景可视化 / 预测导出**（`_viz_pred.py`、`inference.py`、`test_upload_function.py`）：
-        未读区会被渲染/导出成常数 0。
-      - **不同 patch_size 的集成**：`need` 网格只按第一个模型的 patch_size 算。
-    所以按需读是【调用方显式 opt-in】的（`AI4ArcticChallengeTestDataset(..., ondemand_read=)`），
-    不是靠 config 键默认打开；config 的 `val_ondemand_read` 只是全局 kill switch。
+    按需读只解码含有效标签的 tile 所覆盖的 chunk，其余留 0，因此推理必须只在与 patch 网格
+    对齐、不重叠的 tile 上做前向（functions.fast_tiled_val_predict / fast_tiled_val_inference
+    + tile 门控）。读到别处像素的用法都会静默读到 0：重叠滑窗（batched_slide_inference，
+    窗口由 swin_hp.val_stride 决定，base 默认 [56, 56]）、翻转或偏移 TTA、整景可视化与预测
+    导出、不同 patch_size 的模型集成（need 网格只按第一个模型算）。所以按需读由调用方显式
+    开启（AI4ArcticChallengeTestDataset(..., ondemand_read=)），config 的 val_ondemand_read
+    只是全局开关。
     """
     if not options.get('val_ondemand_read', True):
         return False, 'config 的 val_ondemand_read=False（全局关闭）'
@@ -444,31 +397,28 @@ def val_ondemand_ok(options, n_models=1):
         if stride != (ps, ps):
             return False, (f'滑窗推理 val_stride={stride} != ({ps}, {ps})，'
                            f'重叠窗口会读到未解码的区域')
-    # 注：texture_channels 与按需读【兼容】——纹理是 per-tile 在 functions 前向里对每个
-    # 256 tile 独立算的（不在整景 loader 里算），tile 的像素来自已读 chunk，纹理窗口在
-    # tile 内截断（与训练 256 patch 同口径），不需要 tile 之外的邻域，故无需退回整景读。
+    # texture_channels 与按需读兼容：纹理在 functions 里对每个 tile 单独计算，窗口在 tile
+    # 内截断（与训练 patch 同口径），不需要 tile 之外的像素。
     return True, 'ok'
 
 
-# ---- B1 纹理通道（2026-07-25，模型攻坚 Phase 1）---------------------------------------
-# 从 HH（通道 0）在线算的密集纹理特征，拼进输入。3 个多尺度局部标准差（变异函数的密集
-# 代理，测「颗粒度尺度」：小碎冰场方差在很细尺度就饱和，中浮冰场慢慢积累）+ 1 个局部
-# 边界密度（连通域的密集代理，测冰水边界碎不碎）。
-# ⚠️ 增删通道数必须【同步】改：① 模型 in_channels（models/sota/segformer.py 等按
-#   options 推导处 +N_TEXTURE_CHANNELS）；② 本文件两处 _n_channels 预分配。
+# 纹理通道（texture_channels）：从 HH（通道 0）在线算的密集纹理特征。3 个多尺度局部标准差
+# 是变异函数的密集代理（小碎冰场的方差在很细的尺度就饱和，中浮冰场随尺度慢慢累积）；
+# 1 个局部边界密度反映冰水边界的破碎程度。改通道数时要同步改模型 in_channels 的推导
+# （models/sota/segformer.py 等）和本文件两处 _n_channels 预分配。
 N_TEXTURE_CHANNELS = 4
 _TEXTURE_STD_WINDOWS = (3, 7, 15)   # 窗口(px)，80m 像元下 = 240 / 560 / 1200 m
 _TEXTURE_EDGE_WINDOW = 7            # 边界密度窗口(px) ≈ 560 m
 
 
 def _texture_channels(x):
-    """从输入张量的 HH(通道0)算 N_TEXTURE_CHANNELS 个纹理通道，返回 [1, 4, H, W]。
+    """从 x [1, C, H, W] 的 HH（通道 0）算 N_TEXTURE_CHANNELS 个纹理通道，返回 [1, 4, H, W]。
 
-    - 3 个多尺度局部标准差：σ(w) = sqrt(E[HH²]_w − E[HH]²_w)，盒式滤波 O(N)。
-    - 1 个局部边界密度：|∇HH| 的局部均值。
-    count_include_pad=False → 边界像素用实际窗口内像元数(无零偏)。x 形状 [1, C, H, W]，
-    在 z-score 后的 HH 上算(loader 喂的就是 z-scored HH)；新通道不再单独归一化，交由
-    首层 conv/BN 吸收尺度（4 个通道量级 ~O(0.1~1)，与 z-scored 通道同数量级）。"""
+    - 3 个多尺度局部标准差 σ(w) = sqrt(E[HH²]_w - E[HH]²_w)，盒式滤波；
+    - 1 个局部边界密度：L1 梯度幅值的局部均值。
+    count_include_pad=False 使边界像素按窗口内实际像元数平均（无零偏）。输入是 z-score
+    后的 HH；新通道量级约 0.1~1，不再单独归一化，交由首层 conv/BN 吸收。
+    """
     import torch.nn.functional as F
     hh = x[:, 0:1, :, :].float()
     outs = []
@@ -479,7 +429,7 @@ def _texture_channels(x):
         outs.append((meansq - mean * mean).clamp_min(0).sqrt())
     gx = F.pad(hh[:, :, :, 1:] - hh[:, :, :, :-1], (0, 1, 0, 0))   # 水平差分，右侧补 0
     gy = F.pad(hh[:, :, 1:, :] - hh[:, :, :-1, :], (0, 0, 0, 1))   # 垂直差分，底部补 0
-    gmag = gx.abs() + gy.abs()                                     # L1 梯度幅值(便宜)
+    gmag = gx.abs() + gy.abs()                                     # L1 梯度幅值
     ew = _TEXTURE_EDGE_WINDOW
     outs.append(F.avg_pool2d(gmag, ew, stride=1, padding=ew // 2, count_include_pad=False))
     return torch.cat(outs, dim=1)
@@ -488,16 +438,11 @@ def _texture_channels(x):
 def _need_chunk_grid(y, fill_values, charts, H, W, patch_size, chunk):
     """验证按需读：哪些 HDF5 chunk 必须读。返回 (cg_h, cg_w) 的 bool 网格。
 
-    判定分两步，顺序不能反：
-      1) 先在【patch_size 的 tile 网格】上找出「至少含一个有效标签像元」的 tile —— 这与
-         functions.compute_valid_tile_mask 用的是同一套网格，也就是真正会被喂进网络的
-         那些 tile。
-      2) 再把每个有效 tile 覆盖到的【所有】chunk 标为必读。
-
-    ⚠️ 第 2 步不能简化成「chunk 内有有效像元就读」：一个有效 tile 可能跨 2×2 个 chunk，
-    其中某些 chunk 自己一个有效标签都没有，但它承载的是这个 tile 的输入像素——不读的话
-    喂进网络的 patch 会缺一块，预测就变了。chunk(512) 是 patch(256) 的整数倍时这个区别
-    不会显现，但别把这个巧合写死进逻辑。
+    先在 patch_size 的 tile 网格（与 functions.compute_valid_tile_mask 相同，即真正喂进
+    网络的 tile）上找出至少含一个有效标签像元的 tile，再把每个有效 tile 覆盖到的所有
+    chunk 标为必读。不能简化成「chunk 内有有效像元就读」：一个有效 tile 可能跨多个 chunk，
+    其中某个 chunk 自己没有有效标签，却承载着这个 tile 的输入像素。chunk 恰好是 patch 的
+    整数倍时两者等价，但这里的逻辑不依赖这一点。
     """
     valid = None
     for chart in charts:
@@ -522,9 +467,8 @@ def _need_chunk_grid(y, fill_values, charts, H, W, patch_size, chunk):
 def _merge_hist_columns(hist, merge_map, n_new):
     """把 tile 索引的类别直方图按 merge_map 合并列。
 
-    索引 (.npz) 里的 hist/hist_w 永远是按【原始】类别 0..5 存的（scan_tiles.py 不知道
-    合并方案）。而 target_pixel_mix 的下标是【合并后】的类别。两者不对齐的话，
-    _solve_tile_weights 会静默解出一个完全错误的采样分布——不会报错，只会训崩。
+    索引里的 hist/hist_w 总是按原始类别 0..5 存储，而 target_pixel_mix 的下标是合并后的
+    类别；不对齐时 _solve_tile_weights 会静默解出错误的采样分布。
     """
     out = np.zeros((hist.shape[0], n_new), dtype=hist.dtype)
     for c_old in range(hist.shape[1]):
@@ -587,54 +531,73 @@ def _month_sin_cos(filename):
     return math.sin(angle), math.cos(angle)
 
 
+def degrade_resolution_(x, variables, k):
+    """Emulate a coarser sensor grid in place (option input_degrade_factor).
+
+    Every continuous input channel is replaced by its masked k x k block mean,
+    broadcast back to the native grid. Blocks are aligned to the array origin, which
+    is the global grid for whole scenes and, when k divides 512, for 512-px chunks.
+    Invalid pixels (global_valid_mask == 0) are excluded from the means and left
+    unchanged; the mask itself, the labels and the evaluation grid stay native.
+    Derived channels (month, pol ratio, texture) must be computed after this.
+    k <= 1 is a no-op.
+
+    x: torch tensor (1, C, H, W) or (C, H, W), or a numpy view of the same, with
+       channels in the order of `variables`. Returns x.
+    """
+    k = int(k or 1)
+    if k <= 1:
+        return x
+    t = x if torch.is_tensor(x) else torch.from_numpy(x)
+    t4 = t.unsqueeze(0) if t.dim() == 3 else t
+    variables = list(variables)
+    mi = variables.index('global_valid_mask')
+    cont = [i for i, v in enumerate(variables) if v != 'global_valid_mask']
+    H, W = t4.shape[-2], t4.shape[-1]
+    m = (t4[:, mi:mi + 1] > 0.5).to(torch.float32)
+    xc = t4[:, cont].to(torch.float32)
+    num = torch.nn.functional.avg_pool2d(xc * m, k, stride=k, ceil_mode=True)
+    den = torch.nn.functional.avg_pool2d(m, k, stride=k, ceil_mode=True)
+    blk = torch.where(den > 0, num / den.clamp_min(1e-12), torch.zeros_like(num))
+    up = blk.repeat_interleave(k, dim=-2).repeat_interleave(k, dim=-1)[..., :H, :W]
+    t4[:, cont] = torch.where(m > 0, up, xc).to(t4.dtype)
+    return x
+
+
 class AI4ArcticChallengeDataset(Dataset):
-    """Pytorch dataset for loading batches of patches of scenes from the ASID
-    V2 data set."""
+    """Training dataset. Each item is a whole batch of patches (use DataLoader(batch_size=None)).
+
+    Patches come from the tile sampler when `tile_index_path` is set, otherwise from the
+    legacy sampler (random scene, random crop, rejection filters).
+    """
 
     def __init__(self, options, files, do_transform=False):
         self.options = options
         self.files = files
         self.do_transform = do_transform
 
-        # If Downscaling, down sample data and put in on memory
-        if (self.options['down_sample_scale'] == 1):
-            self.downsample = True
-        else:
-            self.downsample = True
-
-        # cls2 filter mask support
         self._cls2_mask_dir = self.options.get('cls2_filter_mask_dir', None)
 
-        if self.downsample:
-            # 场景按需懒加载 + 全局字节预算 LRU 缓存（见 random_crop_downsample /
-            # _get_or_create_cached_scene），不在此处一次性把 self.files 全部读入内存。
-            # 原生分辨率(down_sample_scale=1)下单个场景可达 1~2GB，训练列表几百个场景
-            # 会远超容器内存上限（2026-07-06 OOM 崩溃：66/288 场景即吃满 90GB cgroup 限额）。
-            self._n_charts_init = len(self.options['charts'])
-            self._cache_enabled = bool(self.options.get('enable_scene_cache', True))
+        # Legacy sampler: scenes are loaded lazily into the byte-bounded LRU cache
+        # (_get_or_create_cached_scene), never all at once; a native-resolution scene can
+        # take 1-2 GB.
+        self._n_charts_init = len(self.options['charts'])
+        self._cache_enabled = bool(self.options.get('enable_scene_cache', True))
 
-        # Precompute global_valid_mask channel index for black border filtering during training
+        # Index of global_valid_mask in the full patch (charts first) and among the
+        # feature channels only.
         if 'global_valid_mask' in self.options['train_variables']:
             self.global_valid_mask_idx = (len(self.options['charts']) +
                                           list(self.options['train_variables']).index('global_valid_mask'))
-            # Feature-only index (into scene_feats, which doesn't include chart channels).
             self.global_valid_mask_feat_idx = list(self.options['train_variables']).index('global_valid_mask')
         else:
             self.global_valid_mask_idx = None
             self.global_valid_mask_feat_idx = None
 
-        # Channel numbers in patches, includes reference channel.
-        self.patch_c = len(
-            self.options['train_variables']) + len(self.options['charts'])
-
-        # Kept for backward compatibility; epoch-level logging is handled in quickstart.py.
-        self.patch_log = []
         self._target_chart = self.options.get('target_chart', 'FLOE')
         self._target_chart_idx = self.options['charts'].index(self._target_chart)
 
-        # 2026-07-09 采样吞吐诊断计数器（per-worker，不跨进程汇总，仅供临时诊断用）：
-        # 统计每个 __getitem__ 调用里各拒绝原因的触发次数和场景解码(cache miss)次数，
-        # 每 _diag_log_every 个 batch 打印一次汇总，定位"凑齐一个 batch 为什么慢"。
+        # 采样诊断计数（每个 worker 独立，不跨进程汇总），每 _diag_log_every 个 batch 打印并清零。
         self._diag_counts = {
             'attempts': 0, 'accepted': 0, 'cache_miss': 0,
             'reject_invalid_patch': 0,  # 黑边覆盖不足 或 patch 几乎全是 mask/255
@@ -642,26 +605,22 @@ class AI4ArcticChallengeDataset(Dataset):
             'reject_cls4': 0, 'reject_rare': 0,
         }
         self._diag_batches_done = 0
-        # <=0 视为禁用打印，避免误配置成 0 时在取模处直接 ZeroDivisionError 崩训练。
+        # <=0 表示不打印。
         self._diag_log_every = max(0, self.options.get('diag_log_every_batches', 5))
         self._last_scene_was_cache_hit = None
 
-        # M2 辐射域增强（radaug，2026-08-04；设计见 docs/2026-08-04_M2_radaug.md）：
-        # 以概率 p 给 HH/HV 加一个 mask 内的常数偏移 b，逼模型少依赖绝对辐射水平
-        # （08-04 双向因果探针：±0.7z 能把单景 medium IoU 在 0.01↔0.99 间搬动，而现行
-        # 增强里一条辐射项都没有）。扰动本体在 _augment_x 开头，这里只做零成本读取。
-        # data_augmentations 整键可能缺省（SOD 系 config），全程用 .get 链取。
+        # 辐射域增强（radaug）：以概率 Radiometric_prob 给 HH/HV 的有效像元加常数偏移 b
+        # （可选再做对比度缩放 a），让模型少依赖绝对辐射水平：单景 HH/HV 整体平移约
+        # ±0.7 个标准差就能让 medium IoU 在 0.01 与 0.99 之间变化。扰动本体在 _augment_x。
+        # data_augmentations 整键可能缺省（SOD 系 config），所以用 .get 链取。
         _da = self.options.get('data_augmentations') or {}
         self._radaug_p = float(_da.get('Radiometric_prob', 0) or 0)
         self._radaug_B = float(_da.get('Radiometric_b', 0.30))
-        # M2a 对比度项（2026-08-05，V 批 V1）：a ~ U(1−A, 1+A)，围绕 patch 有效区均值做
-        # 纯对比度缩放（见 _augment_x）。**默认 0 = 关闭**，此时连 a 都不抽一次随机数 ⇒
-        # 现存 radaug-b config 的随机流与数据流逐位不变（smoke_m2_radaug [01] 断言）。
+        # 对比度项 a ~ U(1-A, 1+A)，默认 A=0 关闭；关闭时不抽 a，只配 b 的 config 随机流不变。
         self._radaug_A = float(_da.get('Radiometric_a', 0) or 0)
-        # 通道间抖动幅度固定为 B/3，刻意不单设 config 键：来自第 0 步 0a 共变核对
-        # （corr(HH, HV)=0.595、HH−HV 的景间 std 0.384 vs 单通道 0.427 = 部分共模）
-        # ——共模分量给满 B，通道差分只注入 B/3 的少量抖动，保护 pol_ratio(HH−HV)
-        # 这一路真信号不被差分噪声淹掉。
+        # 逐通道抖动固定为 B/3：HH 与 HV 的景间变化大部分是共模的（corr=0.595，HH-HV 的
+        # 景间 std 0.384，单通道 0.427），所以共模分量给满 B、通道差分只给少量抖动，
+        # 不淹没 pol_ratio (HH-HV) 的真实信号。
         self._radaug_jit = self._radaug_B / 3.0
         self._radaug_gen = None        # 独立 Generator，惰性构造（见 _augment_x）
         self._radaug_mask_idx = None
@@ -672,34 +631,25 @@ class AI4ArcticChallengeDataset(Dataset):
                     'Radiometric_prob>0 需要 train_variables 里含 global_valid_mask：'
                     '辐射扰动只作用于有效像元，黑边与几何 fill 区必须被排除在外。'
                     f'当前 train_variables={_tv}')
-            # SAR 两通道按硬编码 0/1 位扰动（与 _eval_radiometric.channel_layout 同口径），
-            # 顺序变了必须报错而不是静默扰动错通道（code-review P2）。
+            # 扰动作用于硬编码的通道 0/1，顺序不符时报错而不是静默扰动错通道。
             assert _tv[0] == 'nersc_sar_primary' and _tv[1] == 'nersc_sar_secondary', \
                 f'radaug 假定通道 0/1 为 nersc SAR primary/secondary，实际 {_tv[:2]}'
-            # A 的取值域：负值会被 `if self._radaug_A > 0` 静默忽略（配了对比度却完全没
-            # 生效、白跑一枪）；A>=1 时 a~U(1−A,1+A) 会取到 ≤0，对比度翻转/压平成常数，
-            # 那不是"辐射不变性"而是在造无物理意义的样本。
+            # 负的 A 会被静默忽略；A >= 1 时 a 可能 <= 0（对比度翻转或压平），都没有意义。
             assert 0.0 <= self._radaug_A < 1.0, \
                 f'Radiometric_a 必须落在 [0, 1)，得到 {self._radaug_A}'
-            # x_patch 的通道空间就是 train_variables（chart 通道已在 _crop_from_tile /
-            # random_crop 里切掉），所以这里【不能】用带 chart 偏移的
-            # self.global_valid_mask_idx，只能用 feature-only 下标。
+            # x_patch 只含 train_variables 通道（chart 通道已切掉），所以用不带 chart 偏移的下标。
             self._radaug_mask_idx = _tv.index('global_valid_mask')
-            # 生效状态打一行（dataset 在主进程构造，只打一次；防"键名笔误静默关闭、
-            # 白跑 6 小时锚复制品"，与 [TileSampling] 诊断同风格，code-review P7）
+            # dataset 在主进程构造，这行只打印一次，便于从日志确认 radaug 确实生效。
             print(f'[Radaug] p={self._radaug_p} B={self._radaug_B} A={self._radaug_A} '
                   f'jit={self._radaug_jit:.3f} mask_ch={self._radaug_mask_idx}', flush=True)
 
-        # Tile 采样（见模块顶部注释）。配置了 tile_index_path 才启用，否则走旧的
-        # 整景解码 + 随机裁 + 概率拒绝路径（SOD 等未建索引的数据集继续可用）。
+        # 配置了 tile_index_path 才启用 tile 采样，否则走 legacy 路径（未建索引的数据集，如 SOD）。
         self._tile_sampling = False
         if self.options.get('tile_index_path', None):
             self._init_tile_sampling()
 
-        # V2 DANN 场景标签（2026-08-05）：开启时每个 patch 额外携带一个"来自哪一景"的
-        # 域序号（**self.files 内的下标**，而 self.files 就是 train_options['train_list']
-        # ⇒ 与 quickstart 里断言的 len(train_list) 同一套编号），经 prep_dataset 放进
-        # y dict 的 '_domain' 键。关闭时不加键、不多读任何东西、零 RNG、零行为变化。
+        # segformer_dann：每个 patch 额外携带来源场景的域序号（self.files 即 train_list 的
+        # 下标），经 prep_dataset 放进 y['_domain']。关闭时不加键、不消耗随机数。
         self._dann_on = bool(self.options.get('segformer_dann', False))
         if self._dann_on and not self._tile_sampling:
             raise ValueError(
@@ -759,14 +709,11 @@ class AI4ArcticChallengeDataset(Dataset):
         vmt = opts.get('valid_mask_threshold', 0.5)
         keep &= index['valid_ratio'] >= vmt
 
-        # 标签有效率下限。这两个比例度量的是不同的东西，缺一不可：
-        #   valid_ratio       = global_valid_mask==1 的比例，只排除 SAR 黑边；
-        #   label_valid_ratio = FLOE != 255 的比例，还排除陆地和模糊多边形。
-        # 陆地 tile 的 global_valid_mask 全是 1（陆地不是黑边），但标签几乎全是 255。
-        # 不筛掉它们会有两个后果：(1) 从中裁出的 patch 几乎必然过不了标签覆盖检查，
-        # 白白耗掉 max_crop_attempts 次重试；(2) 更隐蔽——下面的 frac 按【有效标签像元】
-        # 归一化，一个只有几十个有效像元且恰好全是巨浮冰的陆地边缘 tile 会得到
-        # frac[vast]=1.0，被权重求解器当成"最纯的巨浮冰 tile"而赋予极高采样概率。
+        # 标签有效率下限。valid_ratio 只排除 SAR 黑边（global_valid_mask==1 的比例），
+        # label_valid_ratio 还排除陆地和模糊多边形（FLOE != 255 的比例）；陆地 tile 的
+        # global_valid_mask 全是 1，标签却几乎全是 255。不筛掉的话：(1) 裁出的 patch 几乎都
+        # 过不了标签覆盖检查，白耗重试；(2) frac 按有效标签像元归一化，只有几十个有效像元
+        # 且恰好全是巨浮冰的陆地边缘 tile 会得到 frac[vast]=1，被求解器赋予极高的采样概率。
         mlvr = float(cfg.get('min_label_valid_ratio', 0.5))
         keep &= index['label_valid_ratio'] >= mlvr
 
@@ -783,9 +730,7 @@ class AI4ArcticChallengeDataset(Dataset):
         # n_classes 是按 chart 索引的字典（见 configs/_base_/base.py），不是整数
         n_cls = opts['n_classes'][self._target_chart]
 
-        # 类别合并（floe_class_merge）时，索引里的直方图仍是按【原始】6 类存的，
-        # 必须先合并成【新】类别空间，才能和 target_pixel_mix 的下标对齐。
-        # 不做这一步不会报错——_solve_tile_weights 会照样解出一个数，但那是错的分布。
+        # 索引直方图按原始 6 类存储；合并类别时先合并列，与 target_pixel_mix 的下标对齐。
         _merge = opts.get('floe_class_merge') if self._target_chart == 'FLOE' else None
         if _merge:
             hist = _merge_hist_columns(hist, _merge, n_cls)
@@ -796,9 +741,8 @@ class AI4ArcticChallengeDataset(Dataset):
             target[int(cls)] = float(share)
         if target.sum() <= 0:
             raise ValueError('tile_sampling.target_pixel_mix 未配置或全为 0。')
-        # 本 datalist 中不存在的类无法被采到（2026-07-16 前 FLOE 的类 1 饼状冰全数据集
-        # 为空即属此类；扩充后它有像素了，但换用旧 datalist/旧数据时仍可能触发）；若对
-        # 空类误配了非零目标，乘法更新会把它的 a_c 推向无穷。这里直接剔除并告警。
+        # 本 datalist 中没有像素的类采不到；给它非零目标会让乘法更新把 a_c 推向无穷，
+        # 所以剔除并告警。
         absent = (hist.sum(axis=0) == 0) & (target > 0)
         if absent.any():
             print(f'[TileSampling] 类别 {np.where(absent)[0].tolist()} 在本 datalist 中没有任何像素，'
@@ -807,15 +751,14 @@ class AI4ArcticChallengeDataset(Dataset):
         target /= target.sum()
 
         weights, achieved = _solve_tile_weights(hist_w, target)
-        # searchsorted 采样：cumsum 末位必须严格 >= 1.0，否则 rand() 极端取值会越界。
+        # searchsorted 采样：cumsum 末位钉成 1.0，否则浮点误差下 rand() 的极端取值会越界。
         self._tile_cum = np.cumsum(weights)
         self._tile_cum[-1] = 1.0
 
         self._patches_per_tile = max(1, cfg.get('patches_per_tile', 2))
         self._tile_sampling = True
 
-        # 冰类从 1 起切（类 1 ice cake 自 2026-07-16 数据集扩充后不再为空；
-        # 合并空间下第 1 列同样是非水类，口径不变）
+        # 类 0 是水，其余都是冰（合并后的类别空间同样如此）。
         n_ice = int((hist[:, 1:].sum(axis=1) > 0).sum())
         names = merged_class_names(_merge, n_cls)
         print(f'[TileSampling] {len(self._tile_row)} tiles over {len(self.files)} scenes '
@@ -830,12 +773,10 @@ class AI4ArcticChallengeDataset(Dataset):
             print(f'[TileSampling][WARN] 期望分布与目标最大偏差 {max_dev:.3f}——目标可能落在 '
                   f'tile 类别分布的凸包之外（某类没有足够"纯"的 tile 把它的占比拉到目标值）。')
 
-        # 采样集中度诊断（2026-07-16 引入，动机是 ice cake 这类"像素占比 0.3%、只在
-        # 少数景出现"的稀有类）：ESS = 1/Σw² 是采样权重的有效样本数——所有 tile 等权时
-        # 等于 tile 总数，权重全压在 k 个 tile 上时约等于 k。ESS 相对 tile 总数塌得越狠，
-        # 说明为命中 target_pixel_mix 采样越是在反复抽同一小撮 tile（过拟合风险）。
-        # 同时报每个类的"承载 tile 数 + 落在这些 tile 上的采样概率质量"：稀有类若以
-        # 很少的 tile 承载了很大的权重和，就该考虑下调它在 target_pixel_mix 里的份额。
+        # 采样集中度诊断：ESS = 1/Σw² 是有效 tile 数（等权时等于 tile 总数，权重全压在 k 个
+        # tile 上时约为 k）。ESS 远小于 tile 总数说明为命中 target_pixel_mix 在反复抽同一小撮
+        # tile。逐类再报承载 tile 数与这些 tile 的采样权重和：稀有类（如只在少数景出现的
+        # ice cake）若由很少的 tile 承载了很大的权重，应下调它的目标份额。
         ess = 1.0 / float((weights ** 2).sum())
         print(f'[TileSampling] effective tiles (ESS=1/Σw²): {ess:,.0f} / {len(weights)}')
         for c, nm in enumerate(names):
@@ -848,31 +789,22 @@ class AI4ArcticChallengeDataset(Dataset):
         return self.options['epoch_len']
 
     def _augment_x(self, x_patch, scene_id):
-        """先施加 M2 辐射扰动（train-only，radaug），再追加 month/pol_ratio/texture 派生通道。
+        """依次做分辨率退化、辐射扰动（radaug，仅训练），再追加 month / pol_ratio / texture 派生通道。
 
-        顺序敏感：派生通道必须从【已扰动】的 HH/HV 算（详见下方 radaug 注释块与
-        docs/2026-08-04_M2_radaug.md §2）。"""
-        # ---- M2 辐射域增强（radaug）：必须在任何派生通道之前 ----
-        # 插在这里而不是 transform() 末尾，一处修正三个一致性问题：pol_ratio / month /
-        # texture 全部从【已扰动】的 HH/HV 派生（否则 pol_ratio 会成为未扰动的干净捷径，
-        # 且 train 与 val 的通道间关系口径错配）。_augment_x 在 transform 之【前】被调用
-        # （tile 路径 _getitem_tile、legacy 路径 _getitem_legacy，两条路径共用本函数，
-        # 所以扰动只需在这里实现一次）。
-        # 关闭时（键缺省或 Radiometric_prob=0）连 Generator 都不建、一次 RNG 都不抽 ⇒
-        # 所有现存 config 的数据流与随机流逐位不变。
+        顺序有意义：派生通道必须从已退化、已扰动的 HH/HV 计算，否则 pol_ratio 会成为未扰动
+        的干净捷径，train 与 val 的通道间关系也会不一致。tile 路径与 legacy 路径都在
+        transform() 之前调用本函数。
+        """
+        x_patch = degrade_resolution_(x_patch, self.options['train_variables'],
+                                      self.options.get('input_degrade_factor', 1))
+        # radaug 关闭时不建 Generator、不抽任何随机数。
         if self.do_transform and self._radaug_p > 0:
             if self._radaug_gen is None:
-                # 独立 Generator：与主随机流完全隔离 ⇒ radaug run 与锚 run 见到逐位相同的
-                # patch 序列与几何增强，唯一差异是辐射扰动本身（E2-vs-N4 级干净对照）。
-                # 种子从 torch.initial_seed() 派生（code-review P1）：worker 里它 =
-                # base_seed + worker_id，base_seed 由主进程 torch RNG 每 epoch 新抽 ⇒
-                # 扰动序列【逐 epoch 变化】，不会每 epoch 重放同一批 b（worker 非持久化、
-                # 每 epoch 重建，常量种子会导致 200 epoch 只用 ~2400 个重复 b 值）。
-                # 对照性不受影响：radaug 不消耗主流 ⇒ 锚 run 与 radaug run 的 base_seed
-                # 序列逐位相同，radaug 流对给定 config 完全确定、可复现。
-                # 不用 np.random：不是因为"worker 同流"（torch≥1.9 已按 worker/epoch 给
-                # numpy 播种，08-04 review P3 纠正了这一误判），而是 numpy 流被 tile 选择
-                # /裁剪位置消费——borrow 它会让 radaug run 与锚 run 的 patch 序列分叉。
+                # 独立 Generator，与主随机流隔离：radaug run 与对照 run 看到逐位相同的 patch
+                # 序列和几何增强。不借用 np.random，因为 numpy 流被 tile 选择和裁剪位置消费，
+                # 借用会让两者的 patch 序列分叉。种子从 torch.initial_seed() 派生（worker 内为
+                # base_seed + worker_id，base_seed 每 epoch 由主进程重新抽取），所以扰动序列
+                # 逐 epoch 变化；常量种子会因 worker 每 epoch 重建而重放同一批 b。
                 info = get_worker_info()
                 wid = info.id if info is not None else 0
                 self._radaug_gen = torch.Generator()
@@ -880,44 +812,30 @@ class AI4ArcticChallengeDataset(Dataset):
                     (torch.initial_seed() * 6364136223846793005 + 7919 * wid + 17)
                     % (2 ** 63))
             g = self._radaug_gen
-            # 触发判定也走独立 Generator（主随机流一位不动）
             if torch.rand(1, generator=g).item() < self._radaug_p:
                 B = self._radaug_B
                 b_common = (torch.rand(1, generator=g).item() * 2 - 1) * B
-                # ⚠️ **抽取顺序定死为：触发判定 → b_common → a → 逐通道抖动**（改动即
-                # 口径断代）。A=0 时【一次都不抽 a】，所以现存的 radaug-b config 消耗的
-                # 随机数序列与本次改动前逐位相同 ⇒ 那些 run 的数据流不变。
-                # M2a 对比度项：a 两通道**共享**（一景的对比度是整体性质，不是逐极化的），
-                # 幅度 A=Radiometric_a。
+                # 抽取顺序固定为：触发判定、b_common、a（仅 A > 0 时）、逐通道抖动；改动顺序会
+                # 改变已有 run 的扰动序列。a 由两个通道共享：对比度是整景性质，不随极化变化。
                 a = 1.0
                 if self._radaug_A > 0:
                     a = 1.0 + (torch.rand(1, generator=g).item() * 2 - 1) * self._radaug_A
-                # mask 门控：黑边（global_valid_mask=0）自动排除；几何 affine 的 fill 区
-                # 也在 mask=0 内（fill 发生在本函数之后的 transform 里，fill=0 ⇒ 掩膜通道
-                # 同步归零），不会被扰动到。
+                # 只扰动有效像元；affine 的 fill 区在之后的 transform 里才产生，同样不受影响。
                 mask = x_patch[:, self._radaug_mask_idx] > 0.5      # (1, H, W)
                 for ch in (0, 1):                                   # 0=HH, 1=HV
                     b = b_common + (torch.rand(1, generator=g).item() * 2 - 1) * self._radaug_jit
-                    # 原地写安全性：x_patch 在 tile 路径来自 _crop_from_tile 的
-                    # np.ascontiguousarray 副本（patch_size < tile_size ⇒ 切片非连续 ⇒
-                    # 必然复制），在 legacy 路径来自 .type(torch.float) 的新张量，两者
-                    # 都不会回写 tile / 场景缓冲。
-                    # ⚠️ 前提是 patch_size < tile_size：等尺寸时 ascontiguousarray 不复制，
-                    #    原地写会污染同一 tile 的下一个 patch。smoke_m2_radaug.py 第 7 条
-                    #    钉住这个前提（热路径不加逐 patch 断言）。
+                    # 原地写不会回写 tile 或场景缓冲：tile 路径的 x_patch 是 _crop_from_tile 里
+                    # np.ascontiguousarray 的副本（前提是 patch_size < tile_size，等尺寸时不复制），
+                    # legacy 路径的 x_patch 是 .type(torch.float) 新建的张量。
                     xc = x_patch[:, ch]
                     if a != 1.0:
-                        # 围绕**本 patch 本通道 mask 内均值**的纯对比度：xc ← m + a·(xc−m) + b。
-                        # a 不改变 patch 均值（E[a·(x−m)]=0）⇒ 与 b 这条加性轴精确解耦，
-                        # 归因干净（否则 a 会顺带带来一个 (1−a)·m 的亮度偏移，与 b 混淆）。
-                        # m_ch **逐 patch 逐通道现算**，不是全局统计量 —— 同一景的不同裁剪
-                        # 位置 m_ch 不同，这是有意的：模型该学的是"局部对比度不影响粒度判读"。
-                        # mask 全 False 时 xc[mask] 为空张量、m_ch=nan，但赋值目标同样为空 ⇒
-                        # 不会有 nan 写进 patch。
+                        # 围绕本 patch、本通道有效像元均值的纯对比度：xc ← m + a·(xc - m) + b。
+                        # a 不改变 patch 均值，因此与加性的 b 解耦。m_ch 逐 patch 现算，不是全局
+                        # 统计量。mask 全 False 时 m_ch=nan，但赋值目标也为空，不会写入 nan。
                         m_ch = float(xc[mask].mean())
                         xc[mask] = m_ch + a * (xc[mask] - m_ch) + b
                     else:
-                        xc[mask] = xc[mask] + b   # A=0：纯 b（radaug 首枪口径，逐位不变）
+                        xc[mask] = xc[mask] + b
         if self.options.get('month_encoding', False):
             s, c = _month_sin_cos(self.files[scene_id])
             H, W = x_patch.shape[-2], x_patch.shape[-1]
@@ -929,102 +847,6 @@ class AI4ArcticChallengeDataset(Dataset):
         if self.options.get('texture_channels', False):
             x_patch = torch.cat([x_patch, _texture_channels(x_patch)], dim=1)
         return x_patch
-
-    def random_crop(self, scene, scene_name=None):
-        """
-        Perform random cropping in scene.
-
-        Parameters
-        ----------
-        scene :
-            Xarray dataset; a MyDS scene with dimensions ('y', 'x').
-        scene_name : str, optional
-            Filename of the scene (used to locate the cls2 filter mask).
-
-        Returns
-        -------
-        x_patch :
-            torch array with shape (len(train_variables),
-            patch_height, patch_width). None if empty patch.
-        y_patch :
-            torch array with shape (len(charts),
-            patch_height, patch_width). None if empty patch.
-        """
-        patch = np.zeros((len(self.options['full_variables']),
-                          self.options['patch_size'],
-                          self.options['patch_size']))
-
-        # Get random index to crop from.
-        row_rand = np.random.randint(
-            low=0, high=scene[self._target_chart].values.shape[0]
-            - self.options['patch_size'])
-        col_rand = np.random.randint(
-            low=0, high=scene[self._target_chart].values.shape[1]
-            - self.options['patch_size'])
-
-        # Discard patches with too many black border (georrectification artifact) pixels.
-        if 'global_valid_mask' in self.options['train_variables']:
-            valid_mask_patch = scene['global_valid_mask'].isel(
-                y=slice(row_rand, row_rand + self.options['patch_size']),
-                x=slice(col_rand, col_rand + self.options['patch_size'])).values
-            valid_ratio = float(np.mean(valid_mask_patch))
-            if valid_ratio < self.options.get('valid_mask_threshold', 0.5):
-                return None, None
-
-        target_patch = scene[self._target_chart].isel(
-            y=slice(row_rand, row_rand + self.options['patch_size']),
-            x=slice(col_rand, col_rand + self.options['patch_size'])).values
-        if np.sum(target_patch != self.options['class_fill_values'][self._target_chart]) > 1:
-
-            # Crop all full-resolution variables (MyDS: all variables at same 80m resolution).
-            patch[0:len(self.options['full_variables']), :, :] = \
-                scene[self.options['full_variables']].isel(
-                y=range(row_rand, row_rand + self.options['patch_size']),
-                x=range(col_rand, col_rand + self.options['patch_size'])).to_array().values
-
-            # SOD-specific: remap labels in-place: merge old class 2 (young ice) into
-            # class 1 (new/young ice). All old labels >=2 (excluding mask=255) shift down by 1.
-            if self._target_chart == 'SOD':
-                sod_ch = patch[self._target_chart_idx]
-                valid = sod_ch != 255
-                sod_ch[valid & (sod_ch >= 2)] -= 1
-
-            # FLOE: 冰山(6)→255，并按 floe_class_merge 合并类别（见 remap_floe_labels）
-            elif self._target_chart == 'FLOE':
-                remap_floe_labels(patch[self._target_chart_idx],
-                                  self.options.get('floe_class_merge'))
-
-            # Boundary erosion: mask out class-boundary pixels that are most likely
-            # mislabeled due to spatial misalignment between CIS ice charts and SAR.
-            _erode_iters = self.options.get('boundary_erosion_iters', 0)
-            if _erode_iters > 0:
-                patch[self._target_chart_idx] = _erode_sod_boundaries(
-                    patch[self._target_chart_idx], erosion_iters=_erode_iters)
-
-            # cls2 filter mask: on-the-fly load from full-resolution .npy mask.
-            if (self._target_chart == 'SOD'
-                    and self._cls2_mask_dir is not None
-                    and scene_name is not None):
-                _mn = os.path.basename(scene_name).replace('.nc', '_cls2_mask.npy')
-                _mp = os.path.join(self._cls2_mask_dir, _mn)
-                if os.path.exists(_mp):
-                    _full_mask = np.load(_mp, mmap_mode='r')
-                    _mask_crop = _full_mask[
-                        row_rand:row_rand + self.options['patch_size'],
-                        col_rand:col_rand + self.options['patch_size']
-                    ]
-                    patch[self._target_chart_idx][_mask_crop] = 255
-
-            x_patch = torch.from_numpy(
-                patch[len(self.options['charts']):, :]).type(torch.float).unsqueeze(0)
-            y_patch = torch.from_numpy(patch[:len(self.options['charts']), :, :]).unsqueeze(0)
-
-        # In case patch does not contain any valid pixels - return None.
-        else:
-            x_patch = None
-            y_patch = None
-
-        return x_patch, y_patch
 
     def random_crop_downsample(self, idx):
         """
@@ -1049,7 +871,7 @@ class AI4ArcticChallengeDataset(Dataset):
         payload, _was_hit = _get_or_create_cached_scene(
             self.options, self.files[idx], self._n_charts_init, self._cls2_mask_dir,
             enable_cache=self._cache_enabled)
-        self._last_scene_was_cache_hit = _was_hit  # 供 __getitem__ 诊断计数用
+        self._last_scene_was_cache_hit = _was_hit  # 供 _getitem_legacy 的诊断计数
         _label = payload['scene_labels']
         _feats = payload['scene_feats']
         _cls2_mask = payload['cls2_mask']
@@ -1124,9 +946,9 @@ class AI4ArcticChallengeDataset(Dataset):
     def _read_tile(self, tile_i):
         """读一个 chunk 对齐的 tile。返回 (len(full_variables), T, T) 的 float32 数组。
 
-        tile 的 row/col 都是 tile_size 的整数倍且 tile_size == HDF5 chunk 边长，所以每个
-        变量恰好命中 1 个 chunk，不跨 chunk 解压——这是 27ms/tile 的来源。任何"抖动"读取
-        （原点不对齐）都会变成 2×2 个 chunk，慢约 1.7 倍。
+        tile 的 row/col 都是 tile_size 的整数倍且 tile_size 等于 HDF5 chunk 边长，所以每个
+        变量恰好只解压 1 个 chunk（约 27ms/tile）；原点不对齐的读取会碰到 2×2 个 chunk，
+        慢约 1.7 倍。
         """
         scene_id = int(self._tile_scene[tile_i])
         r = int(self._tile_row[tile_i])
@@ -1145,9 +967,8 @@ class AI4ArcticChallengeDataset(Dataset):
     def _crop_from_tile(self, tile):
         """在 tile 内随机裁一个 patch_size 的 patch。返回 (x_patch, y_patch) 或 (None, None)。
 
-        裁剪原点限制在 [0, T-ps]，即 patch 完全落在对齐 tile 内部（不跨 chunk）。代价是
-        跨 tile 边界的浮冰在单个 patch 里只能看到一半——但相邻 tile 会从另一侧补上，
-        且浮冰通常横跨多个 tile，随机采样下边界区域仍被覆盖。
+        裁剪原点限制在 [0, T-ps]，patch 完全落在对齐 tile 内部（不跨 chunk）。跨 tile 边界
+        的浮冰在单个 patch 里只能看到一部分，但相邻 tile 会从另一侧覆盖到它。
         """
         ps = self.options['patch_size']
         T = self._tile_size
@@ -1155,10 +976,8 @@ class AI4ArcticChallengeDataset(Dataset):
 
         row_rand = np.random.randint(low=0, high=T - ps + 1)
         col_rand = np.random.randint(low=0, high=T - ps + 1)
-        # 全程 float32：tile 本身就是 float32，标签值 0..255 在 float32 里精确可表示。
-        # 旧路径用 float64 缓冲（np.zeros 的默认 dtype），到这里会逼出一次
-        # torch `.type(torch.float)` 的 float64→float32 拷贝——在 torch 线程超订的容器上
-        # 实测单次 3.3 秒（见 limit_torch_threads 注释），是首版 tile 采样慢 400ms/patch 的主因。
+        # 全程 float32（标签 0..255 在 float32 中精确可表示），省掉 legacy 路径里那次
+        # float64 → float32 的 .type() 拷贝。
         patch = np.ascontiguousarray(tile[:, row_rand:row_rand + ps, col_rand:col_rand + ps])
 
         # 黑边过滤（tile 级已粗筛过 valid_ratio，这里是 patch 级精筛，纯内存操作）
@@ -1172,8 +991,7 @@ class AI4ArcticChallengeDataset(Dataset):
         if np.sum(target_ch != self.options['class_fill_values'][self._target_chart]) <= 1:
             return None, None
 
-        # FLOE: 冰山(6)→255，并按 floe_class_merge 合并类别（见 remap_floe_labels）。
-        # 这是 tile 采样的训练路径——FLOE 实际走的就是这条。
+        # FLOE: 冰山(6)→255，并按 floe_class_merge 合并类别（见 remap_floe_labels）
         if self._target_chart == 'FLOE':
             remap_floe_labels(target_ch, self.options.get('floe_class_merge'))
 
@@ -1182,18 +1000,17 @@ class AI4ArcticChallengeDataset(Dataset):
             patch[self._target_chart_idx] = _erode_sod_boundaries(
                 patch[self._target_chart_idx], erosion_iters=_erode_iters)
 
-        # patch 已经是 float32，from_numpy 直接零拷贝共享内存，不再需要 .type() 转换。
+        # patch 已是 float32，from_numpy 零拷贝。
         x_patch = torch.from_numpy(patch[n_charts:]).unsqueeze(0)
         y_patch = torch.from_numpy(patch[:n_charts]).unsqueeze(0)
         return x_patch, y_patch
 
     def _getitem_tile(self):
-        """Tile 采样路径下组装一个 batch。
+        """Tile 采样路径：组装一个 batch，返回 (x_patches, y_patches, domains)。
 
-        与旧路径的本质区别：tile 已按类别直方图加权采过一次，所以不需要任何概率拒绝
-        （water_rejection / rare_samplers / cls4_rejection 在本路径下全部不生效——目标
-        分布由 tile_sampling.target_pixel_mix 精确指定）。剩下的 patch 级检查只有黑边和
-        标签覆盖两项，都是纯内存操作，失败时在同一个已读入的 tile 里换个位置重裁即可。
+        tile 已按类别直方图加权抽取，目标分布由 tile_sampling.target_pixel_mix 指定，所以
+        legacy 路径的概率拒绝（water_rejection / rare_samplers / cls4_rejection）在这里都不
+        生效。patch 级只检查黑边和标签覆盖，失败时在同一个 tile 内换位置重裁。
         """
         _n_channels = (len(self.options['train_variables'])
                        + (2 if self.options.get('month_encoding', False) else 0)
@@ -1203,8 +1020,7 @@ class AI4ArcticChallengeDataset(Dataset):
         ps = self.options['patch_size']
         x_patches = torch.zeros((batch_size, _n_channels, ps, ps))
         y_patches = torch.zeros((batch_size, len(self.options['charts']), ps, ps))
-        # V2 DANN：逐 patch 的域序号（= self.files 下标）。关闭时为 None ⇒ 不分配、
-        # 不进 y dict，行为与改动前完全一致。
+        # segformer_dann 的逐 patch 域序号（self.files 下标）；关闭时为 None。
         domains = torch.zeros(batch_size, dtype=torch.long) if self._dann_on else None
 
         max_crop_attempts = max(1, self.options.get('max_crop_attempts_per_scene', 20))
@@ -1220,7 +1036,7 @@ class AI4ArcticChallengeDataset(Dataset):
                       f'({self.files[int(self._tile_scene[tile_i])]}) 失败: {e}. 换一个 tile。',
                       flush=True)
                 continue
-            self._diag_counts['cache_miss'] += 1  # 这里等价于"读了一次 tile"
+            self._diag_counts['cache_miss'] += 1  # tile 路径下计的是读入的 tile 数
 
             for _ in range(self._patches_per_tile):
                 if sample_n >= batch_size:
@@ -1246,17 +1062,16 @@ class AI4ArcticChallengeDataset(Dataset):
 
     def prep_dataset(self, x_patches, y_patches, domains=None):
         """
-        Convert patches from 4D numpy array to 4D torch tensor.
+        Cast a batch of patches and split the labels into a per-chart dict.
 
         Parameters
         ----------
-        x_patches : ndarray
-            Patches sampled from ASID3 ready-to-train challenge dataset scenes [PATCH, CHANNEL, H, W] containing only the trainable variables.
-        y_patches : ndarray
-            Patches sampled from ASID3 ready-to-train challenge dataset scenes [PATCH, CHANNEL, H, W] contrainng only the targets.
-        domains : LongTensor [PATCH] 或 None
-            V2 DANN 的逐 patch 域序号（self.files 下标）。None（默认）时 y dict 里
-            **不出现** '_domain' 键 —— 所有现存 config 走的就是这条路，行为逐位不变。
+        x_patches : Tensor [PATCH, CHANNEL, H, W]
+            Input channels (train_variables plus derived channels).
+        y_patches : Tensor [PATCH, len(charts), H, W]
+            Label channels.
+        domains : LongTensor [PATCH] or None
+            segformer_dann 的逐 patch 域序号（self.files 下标）。None 时 y 中没有 '_domain' 键。
 
         Returns
         -------
@@ -1265,23 +1080,18 @@ class AI4ArcticChallengeDataset(Dataset):
         y : Dict
             Dictionary with 3D torch tensors for each chart; reference data for training data x.
         """
-
-        # Convert training data to tensor float.
         x = x_patches.type(torch.float)
-
-        # Store charts in y dictionary.
 
         y = {}
         for idx, chart in enumerate(self.options['charts']):
             y[chart] = y_patches[:, idx].type(torch.long)
 
-        # 下划线前缀的保留键：训练循环按 charts 遍历 y，'_domain' 不在 charts 里 ⇒
-        # 不会被当成一个 chart 参与 CE/指标，只由 DANN 分支显式取用（同 '_supcon' 契约）。
+        # 下划线前缀的保留键：训练循环只按 charts 遍历 y，'_domain' 只由 DANN 分支取用。
         if domains is not None:
             y['_domain'] = domains.long()
 
         return x, y
-    
+
     def transform(self, x_patch, y_patch):
         data_aug_options = self.options['data_augmentations']
         if torch.rand(1) < data_aug_options['Random_h_flip']:
@@ -1292,9 +1102,8 @@ class AI4ArcticChallengeDataset(Dataset):
             x_patch = TF.vflip(x_patch)
             y_patch = TF.vflip(y_patch)
 
-        # E1 尺度保真增强（2026-07-19）：无损 90° 旋转。torch.rot90 无重采样、无
-        # fill 边界，与 h/v flip 组合覆盖完整 D4 对称群。默认 0 = 关闭，旧 config
-        # 行为不变。patch 是方形（256），rot90 不改变形状。
+        # 无损 90° 旋转（不重采样、无 fill 区），与 h/v flip 一起覆盖完整的 D4 群；默认关闭。
+        # patch 是方形，形状不变。
         if torch.rand(1) < data_aug_options.get('Random_rot90_prob', 0):
             k = int(np.random.randint(1, 4))   # {1,2,3} → 90/180/270°
             x_patch = torch.rot90(x_patch, k, dims=[-2, -1])
@@ -1317,11 +1126,9 @@ class AI4ArcticChallengeDataset(Dataset):
                                                 data_aug_options['Random_scale'][0]) +\
                 data_aug_options['Random_scale'][0]
         else:
-            # random_scale = data_aug_options['Random_scale'][1]
-            random_scale = 1.0 
+            random_scale = 1.0
 
-        # 恒等时跳过 affine（纯性能优化：默认 NEAREST 插值下恒等 affine 本就无损，
-        # 跳过不改变数值，只省一次逐 patch 的重采样调用）。
+        # 恒等变换时跳过 affine：NEAREST 插值下恒等 affine 无损，跳过只省时间、不改变数值。
         if random_degree != 0 or random_scale != 1.0:
             x_patch = TF.affine(x_patch, angle=random_degree, translate=(0, 0),
                                 shear=0, scale=random_scale, fill=0)
@@ -1355,16 +1162,12 @@ class AI4ArcticChallengeDataset(Dataset):
             bbx1, bby1, bbx2, bby2 = rand_bbox(x_patches.size(), lam)
             x_patches[:, :, bbx1:bbx2, bby1:bby2] = x_patches[rand_index, :, bbx1:bbx2, bby1:bby2]
             y_patches[:, :, bbx1:bbx2, bby1:bby2] = y_patches[rand_index, :, bbx1:bbx2, bby1:bby2]
-            # ⚠️ **刻意不混 domains**：cutmix 后一个 patch 里有两个景的像素，但域标签保持
-            # 原 patch 的。混入区因此是判别器的标签噪声（占比 = cutmix 触发率 × 混入面积
-            # 比），这是接受的：DANN 的判别器本来就只吃 GAP 后的**整 patch**全局向量，
-            # 没有"哪一块属于谁"的表达；按面积给软标签才是正解，但那要改损失形态、
-            # 不值得在首枪引入。注记见 config 头。
+            # domains 刻意不随 cutmix 混合：混入区成为判别器的少量标签噪声。DANN 判别器只看
+            # 整个 patch 的全局向量，按面积给软标签需要改损失形式。
         x, y = self.prep_dataset(x_patches, y_patches, domains)
 
-        # 采样吞吐诊断：每 _diag_log_every 个 batch 打印一次汇总并清零（临时诊断用，
-        # 2026-07-09 排查首个 batch 组装过慢问题；不跨 worker 汇总，每个 worker 独立打印）。
-        # tile 采样路径下 cache_miss 计的是"读入的 tile 数"，reject_* 只剩黑边/标签覆盖两项。
+        # 每 _diag_log_every 个 batch 打印一次采样诊断并清零（每个 worker 各自打印）。tile 路径
+        # 下 cache_miss 是读入的 tile 数，reject_* 中只有 invalid_patch（黑边或标签覆盖不足）计数。
         self._diag_batches_done += 1
         if self._diag_log_every > 0 and self._diag_batches_done % self._diag_log_every == 0:
             c = self._diag_counts
@@ -1380,10 +1183,10 @@ class AI4ArcticChallengeDataset(Dataset):
         return x, y
 
     def _getitem_legacy(self):
-        """旧路径：随机选场景 → 整景解码(或命中 LRU 缓存) → 随机裁 → 多层概率拒绝重试。
+        """Legacy 路径：随机选场景，整景解码（或命中 LRU 缓存），随机裁，再经概率拒绝过滤。
 
-        仅在未配置 tile_index_path 时使用（SOD 等尚未建 tile 索引的数据集）。FLOE 走
-        _getitem_tile：整景解码约 9.2s/景，是这条路径无法在合理时间内跑完 200 epoch 的根因。
+        仅在未配置 tile_index_path 时使用（未建 tile 索引的数据集，如 SOD）。FLOE 走
+        _getitem_tile：整景解码约 9s/景，这条路径在原生分辨率下太慢。
         """
         _n_channels = (len(self.options['train_variables'])
                        + (2 if self.options.get('month_encoding', False) else 0)
@@ -1395,25 +1198,14 @@ class AI4ArcticChallengeDataset(Dataset):
                                  self.options['patch_size'], self.options['patch_size']))
         sample_n = 0
 
-        # 2026-07-09 吞吐教训（两轮复盘）：
-        # 第一轮——原逻辑每次候选 patch 被任何过滤器拒绝，都会重新随机选一个全新场景，
-        # 而 rare_samplers/water_rejection 等概率过滤器接受率本就不高，几乎每次重试都要
-        # 在原生分辨率(down_sample_scale=1)下重新解码一个新场景(~9~10s)。已修：同一场景
-        # 解码/取缓存一次后，换不同裁剪位置重试最多 max_crop_attempts_per_scene 次。
-        # 第二轮——上面这个修复只解决了"每个 patch 内部的重试"，但**每凑够 1 个有效
-        # patch 后仍立刻换新场景**，一个 batch(16 patch) 仍需要 ~16 次解码，吞吐没有
-        # 本质改善（16 次解码 ÷ 3 worker × ~9.5s ≈ 每 batch 50+ 秒，200 epoch 跑不完）。
-        # 现改为：同一场景一次性产出 patches_per_scene 个 patch（默认 6 个，裁剪位置各自
-        # 随机、允许空间相邻）后才换新场景，把解码成本分摊到多个 patch 上，
-        # 每 batch 所需解码次数从 ~16 降到 ~16/patches_per_scene。
-        # 下界保护：两个参数配成 0/负数都会导致内层循环一次不执行，sample_n 永不增长、
-        # 外层 while 无限空转且不打印任何诊断信息（静默卡死，极难排查）。
+        # 每个场景解码（或取缓存）一次后产出最多 patches_per_scene 个 patch，每个 patch 最多
+        # 在同一场景内重裁 max_crop_attempts 次，把解码成本分摊到多个 patch 上。两者下限
+        # 为 1：配成 0 会让内层循环不执行，外层 while 无声空转。
         max_crop_attempts = max(1, self.options.get('max_crop_attempts_per_scene', 20))
         patches_per_scene = max(1, self.options.get('patches_per_scene', 6))
 
         while sample_n < self.options['batch_size']:
             scene_id = np.random.randint(low=0, high=len(self.files), size=1).item()
-            scene = None
             for _patch_idx in range(patches_per_scene):
                 if sample_n >= self.options['batch_size']:
                     break
@@ -1421,8 +1213,7 @@ class AI4ArcticChallengeDataset(Dataset):
                 fatal_error = False  # 场景解码/裁剪本身出错，整个场景作废
                 for _attempt in range(max_crop_attempts):
                     self._diag_counts['attempts'] += 1
-                    # 实时心跳（不等凑够 5 个 batch 才打印）：每 20 次尝试打印一次，用于
-                    # 在第一个 batch 组装缓慢时也能实时看到进度，而不是完全没有输出。
+                    # 每 20 次尝试打印一次心跳，第一个 batch 组装很慢时也能看到进度。
                     if self._diag_counts['attempts'] % 20 == 0:
                         worker_info = get_worker_info()
                         wid = worker_info.id if worker_info is not None else 'main'
@@ -1430,27 +1221,16 @@ class AI4ArcticChallengeDataset(Dataset):
                               f"{self.options['batch_size']} attempts={self._diag_counts['attempts']} "
                               f"cache_miss={self._diag_counts['cache_miss']}", flush=True)
                     try:
-                        if self.downsample:
-                            self._last_scene_was_cache_hit = None
-                            x_patch, y_patch = self.random_crop_downsample(scene_id)
-                            if self._last_scene_was_cache_hit is False:
-                                self._diag_counts['cache_miss'] += 1
-                        else:
-                            if scene is None:
-                                scene = xr.open_dataset(os.path.join(
-                                    self.options['path_to_train_data'], self.files[scene_id]),
-                                    engine='h5netcdf', mask_and_scale=False)
-                            x_patch, y_patch = self.random_crop(scene, scene_name=self.files[scene_id])
+                        self._last_scene_was_cache_hit = None
+                        x_patch, y_patch = self.random_crop_downsample(scene_id)
+                        if self._last_scene_was_cache_hit is False:
+                            self._diag_counts['cache_miss'] += 1
                     except FileNotFoundError:
                         print(f"File {self.files[scene_id]} not found. Skipping scene.")
                         fatal_error = True
                         break
                     except Exception:
-                        if self.downsample:
-                            print(f"Cropping in {self.files[scene_id]} failed. Skipping.")
-                        else:
-                            print(f"Cropping in {self.files[scene_id]} failed. "
-                                  f"Scene size: {scene[self._target_chart].shape if scene is not None else '?'}. Skipping.")
+                        print(f"Cropping in {self.files[scene_id]} failed. Skipping.")
                         fatal_error = True
                         break
 
@@ -1461,14 +1241,14 @@ class AI4ArcticChallengeDataset(Dataset):
                     x_patch = self._augment_x(x_patch, scene_id)
                     target_flat = y_patch[0, self._target_chart_idx].numpy().flatten()
 
-                    # Filter 1 — Label coverage.
+                    # Filter 1: label coverage.
                     sod_invalid_max = self.options.get('sod_invalid_max_ratio', 1.0)
                     if sod_invalid_max < 1.0:
                         if float((target_flat == 255).sum()) / len(target_flat) > sod_invalid_max:
                             self._diag_counts['reject_label_cov'] += 1
                             continue
 
-                    # Filter 2 — Water patch rejection.
+                    # Filter 2: water patch rejection.
                     water_max_ratio = self.options.get('water_patch_max_ratio', 1.0)
                     water_reject_prob = self.options.get('water_rejection_prob', 0.0)
                     if water_reject_prob > 0.0 and water_max_ratio < 1.0:
@@ -1480,7 +1260,7 @@ class AI4ArcticChallengeDataset(Dataset):
                                 self._diag_counts['reject_water'] += 1
                                 continue
 
-                    # Filter 2b — cls4 (MYI) patch rejection (mirrors water rejection).
+                    # Filter 2b: cls4 (MYI) patch rejection, same scheme as water.
                     cls4_max_ratio = self.options.get('cls4_patch_max_ratio', 1.0)
                     cls4_reject_prob = self.options.get('cls4_rejection_prob', 0.0)
                     if cls4_reject_prob > 0.0 and cls4_max_ratio < 1.0:
@@ -1492,15 +1272,11 @@ class AI4ArcticChallengeDataset(Dataset):
                                 self._diag_counts['reject_cls4'] += 1
                                 continue
 
-                    # Filter 3 — Rare-class weighted sampling.
-                    # Supports two config styles (both can coexist; rare_samplers takes precedence):
-                    #   Legacy:  rare_sampling_classes / rare_sampling_alpha  (single sampler)
-                    #   New:     rare_samplers = [{'classes': [...], 'alpha': float}, ...]
-                    #
-                    # When multiple samplers are configured, acceptance uses OR-max logic:
-                    #   p_combined = max(p_1, p_2, ...)
-                    # Each sampler independently scores the patch; the most favorable score wins.
-                    # This allows per-class tuning without classes interfering with each other.
+                    # Filter 3: rare-class weighted sampling.
+                    # Config: rare_samplers = [{'classes': [...], 'alpha': float}, ...], or the
+                    # older single-sampler keys rare_sampling_classes / rare_sampling_alpha
+                    # (rare_samplers takes precedence). With several samplers the acceptance
+                    # probability is the max over samplers, so classes can be tuned independently.
                     _samplers = self.options.get('rare_samplers', None)
                     if _samplers is None:
                         # Fall back to legacy single-sampler config.
@@ -1536,91 +1312,25 @@ class AI4ArcticChallengeDataset(Dataset):
                     break  # 跳出 attempt 循环，尝试从同一场景再产出下一个 patch
 
                 if fatal_error or not got_patch:
-                    # 场景解码出错，或该场景在 max_crop_attempts 次尝试内一次都没通过
-                    # 过滤器——放弃这个场景，换新场景（不再在这个场景上浪费更多尝试）。
+                    # 解码出错，或 max_crop_attempts 次内都没通过过滤器：放弃这个场景。
                     break
 
-            if scene is not None:
-                scene.close()
-
-        # 第三个返回值是 DANN 的逐 patch 域序号；legacy 路径不支持（__init__ 里已 raise），
-        # 恒为 None，只为与 _getitem_tile 保持同一个调用约定。
+        # legacy 路径不支持 DANN（__init__ 已拒绝），domains 恒为 None。
         return x_patches, y_patches, None
-
-    def save_patch_log(self, save_path, epoch):
-        """
-        Append patch sampling statistics to a CSV file, then clear the log.
-
-        Mode is controlled by train_options['patch_log_mode']:
-          'per_epoch' (default): one row per epoch, columns are total pixel counts
-                                 summed across ALL patches in that epoch.
-          'per_patch'           : one row per patch, columns are pixel counts for
-                                 that individual patch (also records the source file).
-
-        NOTE: requires num_workers=0 to function correctly.
-
-        Parameters
-        ----------
-        save_path : str
-            Path to the CSV file (created on first call, appended thereafter).
-        epoch : int
-            Current epoch number (written into every row).
-        """
-        mode = self.options.get('patch_log_mode', 'per_epoch')
-        prefix = self._target_chart.lower()
-        n_classes = self.options['n_classes'][self._target_chart]
-        real_classes = list(range(n_classes))
-
-        if mode == 'per_epoch':
-            fieldnames = ['epoch'] + [f'{prefix}_{c}' for c in real_classes] + [f'{prefix}_mask']
-        else:  # per_patch
-            fieldnames = ['epoch', 'file'] + [f'{prefix}_{c}' for c in real_classes] + [f'{prefix}_mask']
-
-        write_header = not osp.exists(save_path)
-        with open(save_path, 'a', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            if write_header:
-                writer.writeheader()
-
-            if mode == 'per_epoch':
-                # Aggregate pixel counts across all patches in this epoch into one row.
-                totals = {c: 0 for c in real_classes}
-                totals[255] = 0
-                for entry in self.patch_log:
-                    for c in real_classes:
-                        totals[c] += entry['sod_dist'].get(c, 0)
-                    totals[255] += entry['sod_dist'].get(255, 0)
-                row = {'epoch': epoch}
-                for c in real_classes:
-                    row[f'{prefix}_{c}'] = totals[c]
-                row[f'{prefix}_mask'] = totals[255]
-                writer.writerow(row)
-            else:
-                # One row per patch.
-                for entry in self.patch_log:
-                    row = {'epoch': epoch, 'file': entry['file']}
-                    for c in real_classes:
-                        row[f'{prefix}_{c}'] = entry['sod_dist'].get(c, 0)
-                    row[f'{prefix}_mask'] = entry['sod_dist'].get(255, 0)
-                    writer.writerow(row)
-
-        self.patch_log.clear()
 
 
 class AI4ArcticChallengeTestDataset(Dataset):
-    """Pytorch dataset for loading full scenes from the ASID ready-to-train challenge dataset for inference."""
+    """Validation / test dataset: each item is one whole scene (see __getitem__)."""
 
     def __init__(self, options, files, files_reference=None, mode='test',
                  ondemand_read=False):
         self.options = options
         self.files = files
         self.files_reference = files_reference
-        # 按需读是【显式 opt-in】的，默认关：这个 dataset 有近十个消费者（TTA / 可视化 /
-        # 推理导出 / 历史脚本），其中大多数不满足「只在对齐的 tile 上前向」这个前提，
-        # 默认打开会静默污染它们。安全性判定见 val_ondemand_ok()。
+        # 按需读默认关闭，由调用方显式开启：多数消费者（可视化、推理导出等）不满足
+        # 「只在对齐的 tile 上前向」的前提。判定见 val_ondemand_ok()。
         self.ondemand_read = ondemand_read
 
-        # if mode not in ["train_val", "test_val", "test"]:
         if mode not in ["train", "test", "test_no_gt"]:
             raise ValueError("String variable must be one of 'train', 'test', or 'test_no_gt'")
         self.mode = mode
@@ -1658,7 +1368,6 @@ class AI4ArcticChallengeTestDataset(Dataset):
         x = torch.from_numpy(
             scene[self.options['train_variables']].to_array().values).unsqueeze(0).float()
 
-        # Downscale if needed
         # 验证/测试时可用 val_downsample_scale 单独控制分辨率，避免大场景 GPU OOM
         if self.mode in ('train', 'test', 'test_no_gt') and self.options.get('val_downsample_scale', 1) != 1:
             effective_scale = self.options['val_downsample_scale']
@@ -1686,6 +1395,10 @@ class AI4ArcticChallengeTestDataset(Dataset):
         else:
             y = None
 
+        # 与训练相同：分辨率退化在派生通道之前（整景从原点对齐，即全局网格）。
+        x = degrade_resolution_(x, self.options['train_variables'],
+                                self.options.get('input_degrade_factor', 1))
+
         # Append sin/cos month encoding as 2 constant spatial channels.
         if self.options.get('month_encoding', False) and filename is not None:
             s, c = _month_sin_cos(filename)
@@ -1699,15 +1412,14 @@ class AI4ArcticChallengeTestDataset(Dataset):
             pol_ratio = x[:, 0:1, :, :] - x[:, 1:2, :, :]
             x = torch.cat([x, pol_ratio], dim=1)
 
-        # 纹理通道（B1）【不在这里加】：验证走 per-tile——在 functions.fast_tiled_val_predict
-        # 里对每个 256 tile 单独算纹理（与训练 _augment_x 的 256 patch 同口径），既避免整景
-        # 多 4 通道的内存峰值、又保住按需读，且消除 train/val 边缘不一致。整景 x 保持 8 通道。
+        # 纹理通道不在这里加：functions.fast_tiled_val_predict 对每个 tile 单独计算（与训练
+        # patch 同口径），避免整景多出 4 个通道的内存，也保留按需读。
         return x.float(), y
 
     def _finalize_labels(self, y, filename, effective_scale):
         """标签后处理：类别重映射 / 边界腐蚀 / cls2 污染掩膜。
 
-        ⚠️ 整景读取与「按需读取」两条路径都必须走这里，否则两条路的打分口径会漂移。
+        整景读取和按需读取都走这里，两条路径的标签才一致。
         """
         target_chart = self.options.get('target_chart', 'FLOE')
 
@@ -1719,9 +1431,7 @@ class AI4ArcticChallengeTestDataset(Dataset):
             sod[valid & (sod >= 2)] -= 1
             y['SOD'] = sod
 
-        # FLOE: 冰山(6)→255，并按 floe_class_merge 合并类别（见 remap_floe_labels）。
-        # 这是【验证】路径：必须与上面的训练路径用同一个 merge_map，否则训练学的是
-        # 合并类、验证却按原始类打分，指标会完全错乱。
+        # FLOE: 冰山(6)→255，并按与训练相同的 floe_class_merge 合并类别（见 remap_floe_labels）
         elif target_chart == 'FLOE' and 'FLOE' in y:
             floe = y['FLOE'].copy()
             remap_floe_labels(floe, self.options.get('floe_class_merge'))
@@ -1756,27 +1466,13 @@ class AI4ArcticChallengeTestDataset(Dataset):
                 y['SOD'][_mask_ds] = 255
         return y
 
-    # ------------------------------------------------------------------
-    # 按需读取（2026-07-25）
-    # ------------------------------------------------------------------
     def _ondemand_enabled(self):
-        """本次 __getitem__ 是否走「只读含有效标签的 chunk」。
+        """本样本是否走按需读（只读含有效标签的 chunk）。
 
-        调用方必须显式传 `ondemand_read=True`（判定用 val_ondemand_ok），这里只做与
-        【单个样本】有关的兜底检查。
-
-        实测（_val_loader_timing.py）：val_417 一轮纯数据加载 463s，而带模型的完整验证
-        466s —— 原生分辨率下 GPU 前向已经完全藏在加载后面，**加载是唯一瓶颈**。而
-        val_417 只有 38.6% 的 chunk 含有效标签（_val_tile_gate_audit.py），其余 chunk
-        解压出来的像素全部会被 `~cfv_masks` 丢掉、也被 tile 门控挡在网络之外，纯属白解。
-        实测逐 chunk 按需读 5.41s/景 vs 整景 10.12s/景（_val_read_bench.py）。
-
-        以下情形自动退回整景读取：
-          - 调用方没有 opt-in（ondemand_read=False，默认）；
-          - 没有标签（test_no_gt）：无从判断哪些 chunk 需要；
-          - 降采样（down_sample_scale / val_downsample_scale != 1）：整景 interpolate
-            需要全部像素，按需读会污染插值结果；
-          - config 显式关掉 val_ondemand_read（全局 kill switch）。
+        原生分辨率下验证的瓶颈是数据加载而不是 GPU 前向，而验证集只有约 39% 的 chunk 含
+        有效标签；按需读约 5.4s/景，整景读约 10.1s/景。以下情形退回整景读取：调用方没有
+        传 ondemand_read=True（判定见 val_ondemand_ok）；没有标签（test_no_gt），无从判断
+        需要哪些 chunk；降采样（整景 interpolate 需要全部像素）；config 关闭 val_ondemand_read。
         """
         return (self.ondemand_read
                 and self.mode in ('train', 'test')
@@ -1785,23 +1481,17 @@ class AI4ArcticChallengeTestDataset(Dataset):
                 and self.options.get('val_downsample_scale', 1) == 1)
 
     def prep_scene_ondemand(self, path, filename=None):
-        """用 h5py 只读「含有效标签的 chunk」，其余位置留 0。
+        """用 h5py 只读含有效标签的 chunk，其余位置留 0。返回值与 prep_scene 相同。
 
-        返回值与 prep_scene 完全同构：(x (1,C,H,W) float32, y dict)。未读区域的 x 是 0，
-        这些像素对应的 tile 会被 functions.compute_valid_tile_mask 挡掉、根本不进网络，
-        指标不受影响（等价性由 _val_ondemand_check.py 与 evaluate_scenes 的 CM 对拍验证）。
+        未读区域对应的 tile 会被 functions.compute_valid_tile_mask 挡掉、不进网络，指标不变
+        （tools/checks/ondemand_read.py 与整景路径逐位对拍）。
 
-        读【整景】的例外：
-          - 标签变量：要拿它算「哪些 chunk 需要」，且只是 uint8，很便宜；
-          - `global_valid_mask`：`tfv_mask` 由它推出（__getitem__ 末尾），按需读会在未读
-            区域凭空多出「无效」，与整景路径产生差异。**按变量名强制整读，不靠 dtype
-            大小去猜**——将来它若从 uint8 换成别的 dtype，靠 itemsize 判断会静默出错。
-          - 其余单字节变量：反正便宜，一并整读。
+        整景读取的例外：标签变量（用来决定读哪些 chunk，uint8 很便宜）；global_valid_mask
+        （tfv_mask 由它推出，按变量名强制整读，不靠 dtype 判断）；其余单字节变量（便宜）。
 
-        ⚠️ 内存要点：所有通道（含 month/pol_ratio 派生通道）一次性分配在同一个数组里、
-        且派生通道只在必读 chunk 上计算。**不要改回 `torch.cat`**：cat 会新分配一个满
-        尺寸张量并写满每一页，最大景约 8GB 全部变成实打实的 anon，「未读的页不占物理
-        内存」这个前提当场失效——按需读省下的内存会被它吃掉一大半。
+        内存：所有通道（含 month / pol_ratio）一次性分配在同一个数组里，派生通道只在必读
+        chunk 上计算。不要改成 torch.cat：它会新分配并写满一个整景张量（最大景约 8GB），
+        未读页面不占物理内存的前提就失效了。
         """
         charts = self.options['charts']
         variables = list(self.options['train_variables'])
@@ -1810,24 +1500,24 @@ class AI4ArcticChallengeTestDataset(Dataset):
         use_pol = bool(self.options.get('pol_ratio_channel', False))
 
         with h5py.File(path, 'r', rdcc_nbytes=64 * 1024 ** 2, rdcc_nslots=4001) as f:
-            # ---- 1. 标签（整景）+ 与整景路径完全相同的后处理 ----
+            # 1. 标签整景读取，后处理与整景路径相同
             y = {chart: f[chart][:] for chart in charts}
             y = self._finalize_labels(y, filename, effective_scale=1)
 
-            # ---- 2. 由最终标签算出需要哪些 chunk ----
+            # 2. 由最终标签算出需要哪些 chunk
             first = f[variables[0]]
             H, W = first.shape[-2], first.shape[-1]
             chunk = (first.chunks[-1] if first.chunks else patch_size)
             need = _need_chunk_grid(y, self.options['class_fill_values'], charts,
                                     H, W, patch_size, chunk)
 
-            # ---- 3. 一次性分配所有通道（顺序与 prep_scene 尾部一致：变量、month、pol）----
+            # 3. 一次性分配所有通道，顺序与 prep_scene 一致：变量、month、pol
             n_var = len(variables)
             c_month = n_var if use_month else None
             c_pol = (n_var + (2 if use_month else 0)) if use_pol else None
             n_ch = n_var + (2 if use_month else 0) + (1 if use_pol else 0)
-            # dtype 固定 float32：prep_scene 尾部也是 .float()。用 result_type 的话，任一
-            # 变量是 float64 就会让整景数组翻倍、最后再被 .float() 拷一遍。
+            # dtype 固定 float32，与 prep_scene 的 .float() 一致；按 result_type 推导的话，任一
+            # 变量是 float64 就会让整景数组大小翻倍。
             x_np = np.zeros((n_ch, H, W), dtype=np.float32)
 
             dsets = [f[v] for v in variables]
@@ -1844,6 +1534,9 @@ class AI4ArcticChallengeTestDataset(Dataset):
                 for k, d in enumerate(dsets):
                     if not full_read[k]:
                         x_np[k, y0:y1, x0:x1] = d[y0:y1, x0:x1]
+                # chunk 原点是 512 的倍数，k 整除 512 时 k×k 块与整景路径的网格一致
+                degrade_resolution_(x_np[:n_var, y0:y1, x0:x1], variables,
+                                    self.options.get('input_degrade_factor', 1))
                 # 派生通道只在必读 chunk 上算：写满整景会毁掉稀疏性（见 docstring）
                 if c_month is not None:
                     x_np[c_month, y0:y1, x0:x1] = month_s
@@ -1878,7 +1571,7 @@ class AI4ArcticChallengeTestDataset(Dataset):
         path = os.path.join(root, self.files[idx])
 
         if self._ondemand_enabled():
-            # 只读「含有效标签的 chunk」，其余留 0（见 prep_scene_ondemand）。
+            # 只读含有效标签的 chunk，其余留 0（见 prep_scene_ondemand）。
             x, y = self.prep_scene_ondemand(path, filename=self.files[idx])
             with h5py.File(path, 'r') as _f:
                 original_size = tuple(int(v) for v in _f['nersc_sar_primary'].shape)
@@ -1909,22 +1602,15 @@ class AI4ArcticChallengeTestDataset(Dataset):
 
 
 def val_scoped_options(train_options: dict):
-    """返回【验证/评估侧】应当使用的 options（charts 坍缩为 val_charts = [target_chart]）。
+    """返回验证/评估侧使用的 options：charts 坍缩为 val_charts = [target_chart]。
 
-    辅助任务（config 里的 `aux_charts`，见 get_variable_options）是 **train-only** 的：
-    训练 loss 与训练 dataloader 带上它们，但验证、评估、探针、推理一律只跑 target chart。
-    理由见 get_variable_options 的注释（辅任务标签几乎处处有效 → tile 门控跳过率坍缩、
-    按需读失效、val loss 口径断代；且 val 景未必有辅任务变量，读了会 KeyError）。
-
-    ⚠️ **没配 aux_charts 时返回 train_options 【本身】**（不是副本）：调用方拿到的是同一个
-    对象，没有任何新分支被触发，行为逐位不变。
-
-    所有"拿 checkpoint 在 val 上做前向"的脚本都应当在 `get_variable_options` 之后立刻
-    过一遍本函数（evaluate_scenes / _eval_* / _viz_pred / inference / smoke_sota）。
+    aux_charts 只在训练期生效（理由见 get_variable_options；另外验证景未必有辅任务变量）。
+    没配 aux_charts 时直接返回 train_options 本身，不是副本。凡是拿 checkpoint 在验证集上
+    做前向的脚本，都应在 get_variable_options 之后调用本函数。
     """
     val_charts = train_options.get('val_charts', train_options['charts'])
     if val_charts == train_options['charts']:
-        return train_options            # 单任务：同一对象，零行为变化
+        return train_options            # 单任务：返回同一对象
     val_options = dict(train_options)   # 浅拷贝足够：只覆盖两个顶层键
     val_options['charts'] = val_charts
     val_options['task_weights'] = [1] * len(val_charts)
@@ -1951,13 +1637,10 @@ def get_variable_options(train_options: dict):
     # Derive active charts and task weights from target_chart.
     # Set 'target_chart' in config to 'SOD' or 'FLOE' to switch the detection target.
     target_chart = train_options.get('target_chart', 'FLOE')
-    # 辅助任务（多任务学习）是【只在训练期】生效的：'aux_charts' 里的 chart 会进
-    # train_options['charts']（loss 与 dataloader 会带上它们的标签），但验证/评估一律
-    # 只跑 target chart（见 'val_charts'）。理由：
-    #   ① SIC 这类辅任务几乎处处有标签，进了验证会让 tile 门控的跳过率从 66% 坍缩到 ~0，
-    #      验证耗时约 ×3（按需读也随之失效）；
-    #   ② 验证 loss 会变成"target + 辅任务"的加权和，与历史所有 run 的 val loss 口径断代。
-    # 未配置 aux_charts 时 charts/task_weights 与历史逐位相同，val_charts == charts。
+    # 辅助任务（aux_charts）只在训练期生效：它们进 train_options['charts']，loss 与 dataloader
+    # 带上其标签，但验证/评估只跑 target chart（val_charts）。原因：SIC 这类辅任务几乎处处有
+    # 标签，进了验证会让 tile 门控的跳过率从约 66% 降到接近 0（验证耗时约 3 倍，按需读也失效）；
+    # 验证 loss 也会变成 target 与辅任务的加权和，与只含 target 的 val loss 不可比。
     aux_charts = [c for c in train_options.get('aux_charts', []) if c != target_chart]
     train_options['charts'] = [target_chart] + aux_charts
     aux_w = train_options.get('aux_task_weights', [0.2] * len(aux_charts))
@@ -1967,9 +1650,9 @@ def get_variable_options(train_options: dict):
             f"（aux_charts={aux_charts}，已剔除与 target_chart 重复的项；"
             f"aux_task_weights={list(aux_w)}）")
     train_options['task_weights'] = [1] + [float(w) for w in aux_w]
-    # 验证恒为 target 单任务（消费入口见上面的 val_scoped_options）。
+    # 验证恒为 target 单任务（见 val_scoped_options）。
     train_options['val_charts'] = [target_chart]
-    if aux_charts:   # 只在真的配了辅任务时打印，不给现有 config 增加任何输出
+    if aux_charts:   # 只在配了辅任务时打印
         print(f"[Charts] train={train_options['charts']} "
               f"task_weights={train_options['task_weights']} | "
               f"val={train_options['val_charts']}（辅任务 train-only）")
