@@ -19,7 +19,7 @@
 #   comp_allce configs/FLOE/comp_allce.py                     comp with CE on all polygons
 #
 # FLOE_ARCHIVE=v2 runs on the rebuilt archive instead (tools/build): tags baseline, comp,
-# comp_noord -> configs/V2/*.py, folds from $FLOE_V2_SPLIT, runs named
+# comp_noord, comp_aux -> configs/V2/*.py, folds from $FLOE_V2_SPLIT, runs named
 # floe_<tag>_v2f<K>_s<seed>, CMs under $FLOE_CM_DIR/v2/.
 #
 # Each run gets its own tmux session floe-<tag>-f<K>-s<seed>, writes
@@ -59,8 +59,9 @@ declare -A XEVAL=([res80]=1 [pooled]=1)
 XCFG=configs/AI4Arctic/a4a_baseline.py
 SPLIT=datalists/cv5; DATA_DIR=$FLOE_DATA_DIR; CHART_DIR=$FLOE_CHART_DIR; RUNK=cv5f; CMSUB=cv5; SESS=floe
 if [ "$ARCHIVE" = v2 ]; then
-  CFG=([baseline]=configs/V2/baseline.py [comp]=configs/V2/comp.py [comp_noord]=configs/V2/comp_noord.py)
-  XEVAL=([baseline]=1 [comp]=1 [comp_noord]=1)        # AutoICE test in AutoICE z-scores
+  CFG=([baseline]=configs/V2/baseline.py [comp]=configs/V2/comp.py [comp_noord]=configs/V2/comp_noord.py
+       [comp_aux]=configs/V2/comp_aux.py)
+  XEVAL=([baseline]=1 [comp]=1 [comp_noord]=1 [comp_aux]=1)        # AutoICE test in AutoICE z-scores
   XCFG=configs/AI4Arctic/a4a_v2.py
   SPLIT=$FLOE_V2_SPLIT; DATA_DIR=$FLOE_V2_DIR; CHART_DIR=$FLOE_V2_CHART_DIR; RUNK=v2f; CMSUB=v2; SESS=floe-v2
 fi

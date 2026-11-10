@@ -66,6 +66,22 @@ def check_loss():
     y = torch.full((2, 16, 16), 3, dtype=torch.long)
     y_pure = loss_fn.pure_only(y, bag)
     assert (y_pure[0, :, 8:] == 3).all() and (y_pure[0, :, :8] == 255).all() and (y_pure[1] == 255).all()
+    # ice_only: the floe-size mix of the ice is matched, the water share is left free
+    loss_ice = CompositionLoss(Q, U, min_pixels=1, ice_only=True)
+    logits = torch.zeros(2, 6, 16, 16)
+    logits[:, 0] = 3.0                                     # mostly water
+    logits.requires_grad_(True)
+    opt = torch.optim.Adam([logits], lr=0.1)
+    for _ in range(400):
+        opt.zero_grad()
+        loss, _ = loss_ice(logits, bag)
+        loss.backward()
+        opt.step()
+    p = torch.softmax(logits.detach(), 1)
+    for m, q in ((p[0, :, :, :8].mean((1, 2)), Q[0]), (p[0, :, :, 8:].mean((1, 2)), Q[1])):
+        q = torch.tensor(q)
+        if q[1:].sum() > 0:
+            assert torch.allclose(m[1:] / m[1:].sum(), q[1:] / q[1:].sum(), atol=0.03), m
     print('[B] composition loss OK')
 
 
