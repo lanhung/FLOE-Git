@@ -19,7 +19,7 @@
 #   comp_allce configs/FLOE/comp_allce.py                     comp with CE on all polygons
 #
 # FLOE_ARCHIVE=v2 runs on the rebuilt archive instead (tools/build): tags baseline, comp,
-# comp_noord, comp_aux, pgsg -> configs/V2/*.py, folds from $FLOE_V2_SPLIT, runs named
+# comp_noord, comp_aux, pgsg, pooled -> configs/V2/*.py, folds from $FLOE_V2_SPLIT, runs named
 # floe_<tag>_v2f<K>_s<seed>, CMs under $FLOE_CM_DIR/v2/.
 #
 # Each run gets its own tmux session floe-<tag>-f<K>-s<seed>, writes
@@ -60,8 +60,8 @@ XCFG=configs/AI4Arctic/a4a_baseline.py
 SPLIT=datalists/cv5; DATA_DIR=$FLOE_DATA_DIR; CHART_DIR=$FLOE_CHART_DIR; RUNK=cv5f; CMSUB=cv5; SESS=floe
 if [ "$ARCHIVE" = v2 ]; then
   CFG=([baseline]=configs/V2/baseline.py [comp]=configs/V2/comp.py [comp_noord]=configs/V2/comp_noord.py
-       [comp_aux]=configs/V2/comp_aux.py [pgsg]=configs/V2/pgsg.py)
-  XEVAL=([baseline]=1 [comp]=1 [comp_noord]=1 [comp_aux]=1 [pgsg]=1)        # AutoICE test in AutoICE z-scores
+       [comp_aux]=configs/V2/comp_aux.py [pgsg]=configs/V2/pgsg.py [pooled]=configs/V2/pooled.py)
+  XEVAL=([baseline]=1 [comp]=1 [comp_noord]=1 [comp_aux]=1 [pgsg]=1 [pooled]=1)        # AutoICE test in AutoICE z-scores
   XCFG=configs/AI4Arctic/a4a_v2.py
   SPLIT=$FLOE_V2_SPLIT; DATA_DIR=$FLOE_V2_DIR; CHART_DIR=$FLOE_V2_CHART_DIR; RUNK=v2f; CMSUB=v2; SESS=floe-v2
 fi
@@ -85,8 +85,13 @@ EOF
 
 mkdir -p "$FLOE_CM_DIR/$CMSUB" "$FLOE_CM_DIR/a4a" "$FLOE_CM_DIR/poly/$CMSUB" "$FLOE_ROOT/work_dir"
 if [[ " $* " == *" pooled:"* ]]; then   # (re)build the symlink dir and merged tile index
-  python -m tools.data.pool_archives --archive "$FLOE_DATA_DIR" "$FLOE_TILE_INDEX" \
-      --archive "$FLOE_A4A_DIR" "$FLOE_A4A_TILE_INDEX" --dst "$FLOE_POOL_DIR" --index-out "$FLOE_POOL_TILE_INDEX"
+  if [ "$ARCHIVE" = v2 ]; then
+    python -m tools.data.pool_archives --archive "$FLOE_V2_DIR" "$FLOE_V2_TILE_INDEX" \
+        --archive "$FLOE_A4A_V2_DIR" "$FLOE_A4A_TILE_INDEX" --dst "$FLOE_V2_POOL_DIR" --index-out "$FLOE_V2_POOL_TILE_INDEX"
+  else
+    python -m tools.data.pool_archives --archive "$FLOE_DATA_DIR" "$FLOE_TILE_INDEX" \
+        --archive "$FLOE_A4A_DIR" "$FLOE_A4A_TILE_INDEX" --dst "$FLOE_POOL_DIR" --index-out "$FLOE_POOL_TILE_INDEX"
+  fi
 fi
 for pair in "$@"; do
   TAG=${pair%%:*}; GPU=${pair##*:}
