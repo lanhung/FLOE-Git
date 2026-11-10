@@ -5,7 +5,9 @@
 HH/HV/incidence angle go from AutoICE z-scores back to physical units (AutoICE toolkit
 misc/global_meanstd.npy: HH -14.5083 / 5.6597 dB, HV -24.7012 / 4.7468 dB, incidence angle
 33.9980 / 8.3223 deg), HH/HV are clipped to [-35, 5] dB and re-standardised with this
-archive's statistics. FLOE classes 0-5 are kept; 6 (bergs) and invalid SAR become 255.
+archive's statistics. With --stats autoice the AutoICE z-scores are kept as they are (no
+clip), which is the space of the rebuilt archive (tools/build). FLOE classes 0-5 are kept;
+6 (bergs) and invalid SAR become 255.
 Output uses the 512x512 chunks, 2^-10 z-unit grid and codec of tools.data.recompress.
 
   python -m tools.data.convert_ai4arctic --src $A4A/rtt --dst $A4A/floe_format \
@@ -37,7 +39,9 @@ DB_CLIP = (-35.0, 5.0)
 VERSION = 'tools.data.convert_ai4arctic v1 (2026-11-10)'
 
 
-def harmonise(z, var):
+def harmonise(z, var, native=False):
+    if native:
+        return z.astype(np.float32)
     ma, sa = A4A_STATS[var]
     mo, so = FLOE_STATS[var]
     phys = z.astype(np.float64) * sa + ma
@@ -47,7 +51,8 @@ def harmonise(z, var):
 
 
 def convert_one(job):
-    prep, ref, dst, q, codec = job
+    prep, ref, dst, q, codec, native = job
+    stats = A4A_STATS if native else FLOE_STATS
     t0 = time.time()
     tmp = dst + '.tmp'
     with h5py.File(prep, 'r') as s:
@@ -66,7 +71,7 @@ def convert_one(job):
     floe[~valid] = 255
     out = {}
     for var, z in (('nersc_sar_primary', hh), ('nersc_sar_secondary', hv), ('sar_incidenceangle', ia)):
-        h = harmonise(z, var)
+        h = harmonise(z, var, native)
         h[~valid] = 0
         hq = quantise(h, q)
         hq[~valid] = 0
@@ -78,7 +83,8 @@ def convert_one(job):
             d.attrs[k] = v
         d.attrs['source'] = 'AI4Arctic ready-to-train (doi 10.11583/DTU.21316608 / 21762830)'
         d.attrs['converted_by'] = VERSION
-        d.attrs['harmonised_to'] = 'FLOE archive z-scores (HH/HV clipped to [-35, 5] dB)'
+        d.attrs['harmonised_to'] = ('AutoICE global z-scores (unchanged)' if native else
+                                    'FLOE archive z-scores (HH/HV clipped to [-35, 5] dB)')
         d.attrs['recompress_quant_step_z'] = q
         d.attrs['floe_label_mapping'] = 'AutoICE 0-5 unchanged; 6 (bergs) -> 255; invalid SAR -> 255'
         for name, n in (('y', H), ('x', W)):
@@ -86,8 +92,8 @@ def convert_one(job):
             ds.make_scale(name)
         for var, arr in out.items():
             dv = d.create_dataset(var, data=arr, chunks=(512, 512), **kw)
-            dv.attrs['zscore_mean'] = np.array([FLOE_STATS[var][0]])
-            dv.attrs['zscore_std'] = np.array([FLOE_STATS[var][1]])
+            dv.attrs['zscore_mean'] = np.array([stats[var][0]])
+            dv.attrs['zscore_std'] = np.array([stats[var][1]])
             dv.attrs['autoice_mean'] = np.array([A4A_STATS[var][0]])
             dv.attrs['autoice_std'] = np.array([A4A_STATS[var][1]])
             dv.attrs['quantization_step_zscore'] = q
@@ -124,6 +130,8 @@ def main():
     ap.add_argument('--limit', type=int, default=0, help='convert only the first N scenes (testing)')
     ap.add_argument('--lists-out', default=None, help='write train/val/test datalists here')
     ap.add_argument('--val-frac', type=float, default=0.1, help='fraction of training DAYS held out')
+    ap.add_argument('--stats', choices=['floe', 'autoice'], default='floe',
+                    help='floe: original archive z-scores (v0); autoice: keep AutoICE z-scores (v2)')
     args = ap.parse_args()
     q = 2.0 ** args.q_exp
     # One flat output directory (like the FLOE archive); splits are datalists.
@@ -144,7 +152,7 @@ def main():
             splits[split].append(f)
             dst = osp.join(args.dst, f)
             if not osp.exists(dst):
-                jobs.append((osp.join(sd, f), ref, dst, q, args.codec))
+                jobs.append((osp.join(sd, f), ref, dst, q, args.codec, args.stats == 'autoice'))
     if args.limit:
         jobs = jobs[:args.limit]
     print(f'{len(jobs)} scenes to convert -> {args.dst}', flush=True)

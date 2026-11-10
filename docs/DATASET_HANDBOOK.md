@@ -201,3 +201,6 @@ uint8，取值 **0–6 为类别，255 为忽略(ignore)**：
 - 标准化：HH/HV/入射角按 AutoICE 全局统计量 z-score（与 AutoICE ready-to-train 同一空间），无效像元为 0，2⁻¹⁰ 量化 + zstd，单景约 90 MB。
 - 质控：`archive_log.jsonl` 记录每帧的冰图与时间差、覆盖率、地理定位留出误差、HV 噪底填补比例、类别直方图；冰像元 < 1% 的帧不保留。
 - 运行：`tools/build/run_archive.py`（下载 → 构建 → 删 zip，可断点续跑），环境 `envs/floe-build`，凭据 `$FLOE_ROOT/ASF_credentials.txt`（chmod 600）。
+- 2023 年结果：1254 帧中 663 帧保留，584 帧冰像元 < 1%，3 帧构建时未找到冰图（`no_chart`），4 帧（S1A 轨道 047769）匹配到的冰图没有多边形（`no_polygons`）。类别像元（百万）：水 3286、饼状冰 36、小 187、中 367、大 424、巨 2670；仅 18% 的多边形是“纯”的（单类 ≥ 0.9），其余为混合多边形，这是组成监督的出发点。2022、2024–2026 年共 5666 帧已配对，正在构建。
+- 划分：`tools/build/split.py`。共享 datatake、共享冰图或同一 DMI 区域同一 ISO 周的帧并为一组（并查集），整组分到折中，按浮冰类别像元数贪心平衡（稀有类按逆频率加权）。2023 试点为 `datalists/v2_2023`（663 景、210 组，各折各类份额 0.18–0.21），全年份档案完成后重新划分。
+- 训练：`configs/V2/{baseline,comp,comp_noord}.py`，`FLOE_ARCHIVE=v2 bash tools/system/launch_fold.sh K SEED tag:GPU`；tile 索引 `index/v2_2023_tile_index.npz`（`scan_tiles --lists` 只扫划分内的景）。外部测试为 AutoICE 的 20 景测试集，用 `convert_ai4arctic --stats autoice` 保持 AutoICE z-score（`ai4arctic/floe_format_v2`，`configs/AI4Arctic/a4a_v2.py`）。
