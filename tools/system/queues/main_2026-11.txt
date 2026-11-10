@@ -1,9 +1,7 @@
 # Main GPU queue. READY | COMMAND ({GPU} = first idle GPU). Strict order.
 # AutoICE baseline and PGSG were launched first (07:09, 07:31 on 2026-11-10).
+# Old-archive references only: its grid is equal-degree lat/lon (anisotropic pixels),
+# so pooled and resolution runs wait for the rebuilt archive (tools/build).
 fold0 | bash tools/system/launch_fold.sh 0 42 baseline:{GPU}
 fold0 | bash tools/system/launch_fold.sh 0 42 pgsg:{GPU}
 fold0 | bash tools/system/launch_fold.sh 0 42 res80:{GPU}
-fold0 | bash tools/system/launch_fold.sh 0 42 pooled:{GPU}
-fold0 | bash tools/system/launch_fold.sh 0 42 pgsg_noev:{GPU}
-fold0 | bash tools/system/launch_fold.sh 0 42 res160:{GPU}
-fold0 | bash tools/system/launch_fold.sh 0 42 gate_noev:{GPU}
