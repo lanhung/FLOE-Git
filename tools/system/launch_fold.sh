@@ -18,11 +18,15 @@
 #   comp_noord configs/FLOE/comp_noord.py                     comp without the ordinal term
 #   comp_allce configs/FLOE/comp_allce.py                     comp with CE on all polygons
 #
+# FLOE_ARCHIVE=v2 runs on the rebuilt archive instead (tools/build): tags baseline, comp,
+# comp_noord -> configs/V2/*.py, folds from $FLOE_V2_SPLIT, runs named
+# floe_<tag>_v2f<K>_s<seed>, CMs under $FLOE_CM_DIR/v2/.
+#
 # Each run gets its own tmux session floe-<tag>-f<K>-s<seed>, writes
 #   $FLOE_ROOT/work_dir/floe_<tag>_cv5f<K>_s<seed>/   (checkpoint, offline wandb)
 #   $FLOE_LOG_DIR/floe_<tag>_cv5f<K>_s<seed>.log     (train + eval log, EXIT= lines)
 #   $FLOE_CM_DIR/cv5/<tag>_s<seed>_f<K>.npz          (per-scene CM for paired_cv)
-#   $FLOE_CM_DIR/a4a/<tag>_s<seed>_f<K>_test.npz     (res80, pooled: AutoICE test scenes)
+#   $FLOE_CM_DIR/a4a/<tag>_s<seed>_f<K>_test.npz     (v0 res80, pooled: AutoICE test scenes)
 #   $FLOE_CM_DIR/poly/<tag>_s<seed>_f<K>.npz         (per-polygon histograms, if $FLOE_CHART_DIR exists)
 # Refuses to start if a fold scene is missing or partial, the GPU is busy, or the
 # run directory already exists (no silent overwrite or resume).
@@ -32,6 +36,7 @@ source tools/system/floe_env.sh >/dev/null
 
 FOLD=$1; SEED=$2; shift 2
 [ $# -ge 1 ] || { echo "need at least one TAG:GPU"; exit 2; }
+ARCHIVE=${FLOE_ARCHIVE:-v0}
 
 declare -A CFG=(
   [baseline]=configs/FLOE/sota_segformer_in1k_dlr_417.py
@@ -47,16 +52,23 @@ declare -A CFG=(
   [comp_noord]=configs/FLOE/comp_noord.py
   [comp_allce]=configs/FLOE/comp_allce.py
 )
-# No-GLCM models are also scored on the 20 AutoICE test scenes (the pooled config sees both archives).
+# No-GLCM models are also scored on the 20 AutoICE test scenes, which
+# tools.data.convert_ai4arctic standardised to this archive's z-scores.
 declare -A XEVAL=([res80]=1 [pooled]=1)
-TRAIN_LIST=datalists/cv5/fold${FOLD}_train.json
-VAL_LIST=datalists/cv5/fold${FOLD}_val.json
+SPLIT=datalists/cv5; DATA_DIR=$FLOE_DATA_DIR; CHART_DIR=$FLOE_CHART_DIR; RUNK=cv5f; CMSUB=cv5; SESS=floe
+if [ "$ARCHIVE" = v2 ]; then
+  CFG=([baseline]=configs/V2/baseline.py [comp]=configs/V2/comp.py [comp_noord]=configs/V2/comp_noord.py)
+  XEVAL=()
+  SPLIT=$FLOE_V2_SPLIT; DATA_DIR=$FLOE_V2_DIR; CHART_DIR=$FLOE_V2_CHART_DIR; RUNK=v2f; CMSUB=v2; SESS=floe-v2
+fi
+TRAIN_LIST=$SPLIT/fold${FOLD}_train.json
+VAL_LIST=$SPLIT/fold${FOLD}_val.json
 [ -f "$TRAIN_LIST" ] && [ -f "$VAL_LIST" ] || { echo "missing fold $FOLD lists"; exit 2; }
 
 # All scenes of this fold must be present and complete.
-python - "$TRAIN_LIST" "$VAL_LIST" <<'EOF'
+python - "$TRAIN_LIST" "$VAL_LIST" "$DATA_DIR" <<'EOF'
 import json, os, sys
-d = os.environ['FLOE_DATA_DIR']
+d = sys.argv[3]
 names = set(json.load(open(sys.argv[1]))) | set(json.load(open(sys.argv[2])))
 on_disk = set(os.listdir(d))
 missing = sorted(n for n in names if n not in on_disk)
@@ -67,7 +79,7 @@ if missing or partial:
 print(f'[launch] all {len(names)} fold scenes present')
 EOF
 
-mkdir -p "$FLOE_CM_DIR/cv5" "$FLOE_CM_DIR/a4a" "$FLOE_CM_DIR/poly" "$FLOE_ROOT/work_dir"
+mkdir -p "$FLOE_CM_DIR/$CMSUB" "$FLOE_CM_DIR/a4a" "$FLOE_CM_DIR/poly/$CMSUB" "$FLOE_ROOT/work_dir"
 if [[ " $* " == *" pooled:"* ]]; then   # (re)build the symlink dir and merged tile index
   python -m tools.data.pool_archives --archive "$FLOE_DATA_DIR" "$FLOE_TILE_INDEX" \
       --archive "$FLOE_A4A_DIR" "$FLOE_A4A_TILE_INDEX" --dst "$FLOE_POOL_DIR" --index-out "$FLOE_POOL_TILE_INDEX"
@@ -75,33 +87,33 @@ fi
 for pair in "$@"; do
   TAG=${pair%%:*}; GPU=${pair##*:}
   [ -n "${CFG[$TAG]:-}" ] || { echo "unknown tag $TAG"; exit 2; }
-  RUN=floe_${TAG}_cv5f${FOLD}_s${SEED}
+  RUN=floe_${TAG}_${RUNK}${FOLD}_s${SEED}
   WD=$FLOE_ROOT/work_dir/$RUN
   LOG=$FLOE_LOG_DIR/$RUN.log
-  CM=$FLOE_CM_DIR/cv5/${TAG}_s${SEED}_f${FOLD}.npz
+  CM=$FLOE_CM_DIR/$CMSUB/${TAG}_s${SEED}_f${FOLD}.npz
   XCMD=true
   if [ -n "${XEVAL[$TAG]:-}" ]; then
-    XCMD="python -m tools.evaluate --config configs/Pooled/pooled_noglcm.py --checkpoint $WD/best_model_$RUN.pth \
+    XCMD="python -m tools.evaluate --config configs/AI4Arctic/a4a_baseline.py --checkpoint $WD/best_model_$RUN.pth \
           --val-list datalists/ai4arctic/test.json --dump-cm $FLOE_CM_DIR/a4a/${TAG}_s${SEED}_f${FOLD}_test.npz \
           --output-dir $WD/eval_a4a_test; echo EXIT_EVAL_A4A=\$?"
   fi
   if [ -e "$WD" ]; then echo "[launch] $RUN: $WD exists, skipping"; continue; fi
   USED=$(nvidia-smi -i "$GPU" --query-gpu=memory.used --format=csv,noheader,nounits)
   if [ "$USED" -gt 1000 ]; then echo "[launch] $RUN: GPU $GPU busy (${USED} MiB), skipping"; continue; fi
-  tmux new-session -d -s "floe-${TAG}-f${FOLD}-s${SEED}" "
+  tmux new-session -d -s "${SESS}-${TAG}-f${FOLD}-s${SEED}" "
     source tools/system/floe_env.sh >/dev/null
-    export CUDA_VISIBLE_DEVICES=$GPU
+    export CUDA_VISIBLE_DEVICES=$GPU FLOE_V2_SPLIT=$FLOE_V2_SPLIT
     {
       echo \"[launch] \$(date -Is) $RUN on GPU $GPU, config ${CFG[$TAG]}\"
       python -m tools.train ${CFG[$TAG]} --fold $FOLD --seed $SEED \
           --wandb-project MyDS-FLOE --wandb-name $RUN --work-dir $WD
       echo \"EXIT_TRAIN=\$?\"
-      CA=; [ -d \"\$FLOE_CHART_DIR\" ] && CA=\"--composition-dir \$FLOE_CHART_DIR --dump-polygons $FLOE_CM_DIR/poly/${TAG}_s${SEED}_f${FOLD}.npz\"
+      CA=; [ -d $CHART_DIR ] && CA=\"--composition-dir $CHART_DIR --dump-polygons $FLOE_CM_DIR/poly/$CMSUB/${TAG}_s${SEED}_f${FOLD}.npz\"
       python -m tools.evaluate --config ${CFG[$TAG]} --checkpoint $WD/best_model_$RUN.pth \
           --val-list $VAL_LIST --dump-cm $CM --output-dir $WD/eval \$CA
       echo \"EXIT_EVAL=\$?\"
       $XCMD
       echo \"[launch] \$(date -Is) done\"
     } > $LOG 2>&1"
-  echo "[launch] $RUN started on GPU $GPU (tmux floe-${TAG}-f${FOLD}-s${SEED}, log $LOG)"
+  echo "[launch] $RUN started on GPU $GPU (tmux ${SESS}-${TAG}-f${FOLD}-s${SEED}, log $LOG)"
 done
