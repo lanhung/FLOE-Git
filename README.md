@@ -3,7 +3,7 @@
 基于 Sentinel-1 EW SAR 的海冰浮冰尺寸（floe size）逐像素语义分割。标签来自业务冰图多边形的
 主导浮冰尺寸，6 类（water / cake / small / medium / big / vast），ignore index 255，80 m 网格。
 包含 SegFormer-B2 基线、PGSG（physics-guided scale gating）及其对照、AutoICE 公开基准的适配、
-论文诊断工具和论文源码。数据构建（Sentinel-1 预处理与冰图配准）代码不在本仓库。
+论文诊断工具和论文源码，以及从 Sentinel-1 原始产品与 DMI 冰图重建数据集的代码（`tools/build`）。
 
 ## 目录
 
@@ -13,7 +13,8 @@ floe/            模型、数据读取、损失与指标
   models/legacy/ 早期 U-Net / Swin（infer.py 与旧配置仍引用）
 configs/         FLOE/：本档案；AI4Arctic/：AutoICE 基准；_base_/：公共默认值
 datalists/       cv5/：分组五折名单；ai4arctic/：AutoICE 名单与官方 MD5 清单
-tools/           train / evaluate / infer 入口，以及 data、analysis、figures、checks、system
+tools/           train / evaluate / infer 入口，以及 build、data、analysis、figures、checks、system
+preprocessing/   原作者的 SNAP 处理与标注脚本（旧档案的来源，保留备查，不再使用）
 docs/            数据手册、计划、论文数字来源、诊断日志
 paper/           论文 LaTeX 与插图
 ```
@@ -77,3 +78,7 @@ python -m tools.analysis.paired_cv --a "$FLOE_CM_DIR/cv5/baseline_s42_f{K}.npz" 
 
 MIT，见 [LICENSE](LICENSE)。`floe/functions.py` 等文件源自滑铁卢大学的 AutoICE 工具包，保留其作者信息。
 外部数据（Sentinel-1、冰图、AI4Arctic，CC BY 4.0）与预训练权重按各自许可使用。
+
+## 数据来源
+
+旧档案（417 景）由 `preprocessing/`（SNAP 流程）生成；其问题与替代方案见 `docs/DATA_PIPELINE_AUDIT.md`。新档案由 `tools/build` 生成。
