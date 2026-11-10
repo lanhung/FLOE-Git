@@ -43,6 +43,10 @@ The replacement is `tools/build` (AI4Arctic-style processing, see the end of thi
    draws each regional chart on one Sentinel-1 image and names it with that image's time, so the
    exact chart is available; AI4Arctic matched within 5 min. East Greenland ice drifts ~15 km/day
    (up to ~70 km/day), so a chart from another pass or day misplaces labels by tens of km.
+   *Measured* (`tools.build.pair`, 2023): only 57 of the archive's 102 scenes from 2023 have a DMI
+   chart within 30 min of the image; the other 45 were labelled from a chart of another pass or
+   day. Example: S1A_..._20230302T201210 (20:12 UTC) has no DMI chart that evening; the nearest
+   charts of that area are 10.5 h before and 24.5 h after.
 7. **Class-specific thresholds that remove big and vast floe.** `floe_label.py:17-23`: cake,
    small and medium need CT >= 6/10 and dominance >= 0.65, but big and vast need CT >= 9/10 and
    dominance >= 0.9. AutoICE uses 0.65 for every class and no CT condition. In the mixed East
@@ -69,6 +73,7 @@ rebuilt with `tools/build`:
 | geometry | WGS84 equal-degree grid, no coordinates stored | SAR ground range, 40 m -> 80 m by 2 x 2 mean, tie-point grid stored |
 | noise | SNAP, negatives clipped, [-35, 5] dB clip | ESA range x azimuth vectors, negatives kept through averaging |
 | speckle filter | Refined Lee 7 x 7 | none (AI4Arctic) |
+| scene choice | prescreened by class, any S1 product of a charted date | chart-first: the S1 frames each DMI chart was drawn on (`pair.py`) |
 | chart match | same date +-2 days, first chart of the day | DMI chart of the same image (+-30 min) overlapping the footprint |
 | labels | dominant FLOE, class-specific thresholds | SIC/SOD/FLOE with the AutoICE 65 % rule for all classes, polygon ids, egg codes, compositions |
 | texture | GLCM 11 x 11 on filtered HH | none stored (computable later if an ablation needs it) |
