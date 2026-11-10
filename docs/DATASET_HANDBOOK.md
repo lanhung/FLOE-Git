@@ -188,3 +188,16 @@ uint8，取值 **0–6 为类别，255 为忽略(ignore)**：
 - 编码：Blosc-zstd（level 5）+ bit-shuffle。读取需 `import hdf5plugin`（仓库读取路径均已导入；不要同时设置 `HDF5_PLUGIN_PATH`）。
 - 实测（12 景试转换）：10.4 GB → 4.3 GB（2.41×）；chunk 解码 5.3 → ~2 ms/变量；训练 batch 载入快约 1.2×；同种子下训练 batch 标签完全相同，输入差 ≤ q/2（派生极化通道 ≤ q）。每个输出文件在落盘前与源文件逐变量核对。
 - 无损重编码（zstd+bit-shuffle）体积不变（浮点尾数为噪声）；2⁻⁸ 网格可到约 3.1×，误差 0.016 dB（HH），未采用。
+
+---
+
+## 12. 重建档案 v2（`tools/build`，2026-11 起）
+
+旧档案（v0，417 景）的问题见 `docs/DATA_PIPELINE_AUDIT.md`。v2 按 AI4Arctic 的做法从 Sentinel-1 原始产品与 DMI 冰图重建：
+
+- 选景：冰图优先。每张 DMI 区域冰图都画在一景 Sentinel-1 上并以成像时刻命名；`pair.py` 为每张冰图找 ±30 min 内、与冰图相交的 EW GRDM HH/HV 帧。2023 年 1082 张冰图中 537 张配到 1254 帧，其余画在其他卫星上，不用。
+- SAR：ESA 噪声向量（距离向 × 方位向）去噪、σ0 定标，2×2 线性均值到 80 m，保留 SAR 几何（不投影、不滤波）；入射角与地理定位来自产品的系点网格，网格存于 `sar_grid_*`。
+- 标签：多边形经 Clough-Tocher 反插值投影到图像坐标后栅格化（`polygon_id`），按 AutoICE 规则解码出 SIC（十分位）、SOD（0–5）、FLOE（0–6，6 为冰山，训练时忽略）；每个多边形的原始蛋码、标签与浮冰尺寸组成存于 `poly_*`，组成监督的 sidecar 在 `charts_v2/<scene>.chart.h5`。`chart_edge_distance` 为到最近多边形边界的像元数，可用于边界缓冲。
+- 标准化：HH/HV/入射角按 AutoICE 全局统计量 z-score（与 AutoICE ready-to-train 同一空间），无效像元为 0，2⁻¹⁰ 量化 + zstd，单景约 90 MB。
+- 质控：`archive_log.jsonl` 记录每帧的冰图与时间差、覆盖率、地理定位留出误差、HV 噪底填补比例、类别直方图；冰像元 < 1% 的帧不保留。
+- 运行：`tools/build/run_archive.py`（下载 → 构建 → 删 zip，可断点续跑），环境 `envs/floe-build`，凭据 `$FLOE_ROOT/ASF_credentials.txt`（chmod 600）。
