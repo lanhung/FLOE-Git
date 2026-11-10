@@ -5,7 +5,8 @@ Follows the AI4Arctic choices (no map projection, no speckle filter, 40 m -> 80 
 
     sigma0 = (DN^2 - noise) / A_sigma^2          (S1-RS-MDA-52-7441, MPC-0392)
 
-Negative values after noise subtraction are kept through the 2x2 average, which
+The 2x2 mean of DN^2 is calibrated and denoised with the LUTs evaluated at the 80 m
+pixel centres (they vary over hundreds of pixels), and negative values are kept, which
 leaves the mean unbiased; pixels still <= 0 afterwards (HV near the noise floor) are
 replaced by a 9x9 local mean and, failing that, a floor. The fraction replaced is
 returned for QC. The NERSC denoiser used by AI4Arctic is not used because it has no
@@ -21,7 +22,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 from lxml import etree
-from scipy.interpolate import RegularGridInterpolator
+from scipy.interpolate import RectBivariateSpline
 from scipy.ndimage import uniform_filter
 
 POLS = ('hh', 'hv')
@@ -58,20 +59,15 @@ def _vectors(root, list_tag, vec_tag, value_tag):
     return np.array(lines), pixels, values
 
 
-def _row_interpolator(lines, pixels, values, ncols):
-    """Values given on (line, pixel) vectors -> function(rows) -> [len(rows), ncols]
-    (linear along pixel within each vector, then linear between vector lines)."""
-    cols = np.arange(ncols)
-    grid = np.stack([np.interp(cols, p, v) for p, v in zip(pixels, values)])   # [K, ncols]
+def _vector_grid(lines, pixels, values, rows, cols):
+    """LUT given on (line, pixel) vectors, evaluated on the grid rows x cols (40 m
+    pixel coordinates): linear along pixel within each vector, then between vectors."""
+    grid = np.stack([np.interp(cols, p, v) for p, v in zip(pixels, values)]).astype(np.float32)
     order = np.argsort(lines)
     lines, grid = lines[order].astype(np.float64), grid[order]
-
-    def at(rows):
-        rows = np.asarray(rows, dtype=np.float64)
-        k = np.clip(np.searchsorted(lines, rows) - 1, 0, len(lines) - 2)
-        w = np.clip((rows - lines[k]) / (lines[k + 1] - lines[k]), 0, 1)[:, None]
-        return (1 - w) * grid[k] + w * grid[k + 1]
-    return at
+    k = np.clip(np.searchsorted(lines, rows) - 1, 0, len(lines) - 2)
+    w = np.clip((rows - lines[k]) / (lines[k + 1] - lines[k]), 0, 1).astype(np.float32)[:, None]
+    return (1 - w) * grid[k] + w * grid[k + 1]
 
 
 def _azimuth_noise(root, nrows, ncols):
@@ -117,62 +113,64 @@ def process(zip_path, block=1024):
     info = ann['hh'].find('.//imageInformation')
     H, W = int(info.findtext('numberOfLines')), int(info.findtext('numberOfSamples'))
     H2, W2 = H // 2, W // 2
-    out = {p: np.full((H2, W2), np.nan, np.float32) for p in POLS}
-    count = np.zeros((H2, W2), np.uint8)
+    # calibration and noise vary over hundreds of pixels, so they are evaluated once at
+    # the centres of the 80 m pixels and applied to the 2 x 2 mean of DN^2
+    rows80 = np.arange(H2) * 2 + 0.5
+    cols80 = np.arange(W2) * 2 + 0.5
+    out = {}
+    count = None
     replaced = {}
 
     for p in POLS:
+        with rasterio.open(f'/vsizip/{zip_path}/{tif[p]}') as src:
+            dn_full = src.read(1)[:H2 * 2, :W2 * 2]
+        dn2 = np.empty((H2, W2), np.float32)
+        cnt = np.empty((H2, W2), np.uint8)
+        for r0 in range(0, H2 * 2, block):
+            d = dn_full[r0:r0 + block].astype(np.float32)
+            v = d > 0
+            o0 = r0 // 2
+            n = len(d) // 2
+            dn2[o0:o0 + n] = (d * d).reshape(n, 2, W2, 2).sum((1, 3))
+            cnt[o0:o0 + n] = v.reshape(n, 2, W2, 2).sum((1, 3))
+        del dn_full
+        with np.errstate(invalid='ignore', divide='ignore'):
+            dn2 = np.where(cnt >= 2, dn2 / np.maximum(cnt, 1), np.nan).astype(np.float32)
+
         cl, cp, cv = _vectors(cal[p], 'calibrationVectorList', 'calibrationVector', 'sigmaNought')
-        A = _row_interpolator(cl, cp, cv, W)
+        A = _vector_grid(cl, cp, cv, rows80, cols80)
         if noi[p].find('.//noiseRangeVector') is not None:
             nl, np_, nv = _vectors(noi[p], 'noiseRangeVectorList', 'noiseRangeVector', 'noiseRangeLut')
             az = _azimuth_noise(noi[p], H, W)
         else:                                            # IPF < 2.9: range vectors only
             nl, np_, nv = _vectors(noi[p], 'noiseVectorList', 'noiseVector', 'noiseLut')
             az = []
-        N = _row_interpolator(nl, np_, nv, W)
-        with rasterio.open(f'/vsizip/{zip_path}/{tif[p]}') as src:
-            for r0 in range(0, H2 * 2, block):
-                r1 = min(r0 + block, H2 * 2)
-                dn = src.read(1, window=((r0, r1), (0, W))).astype(np.float64)
-                rows = np.arange(r0, r1)
-                noise = N(rows)
-                for (a0, a1, c0, c1, lines, lut) in az:
-                    s0, s1 = max(r0, a0), min(r1, a1 + 1)
-                    if s0 >= s1:
-                        continue
-                    f = np.interp(np.arange(s0, s1), lines, lut)[:, None]
-                    noise[s0 - r0:s1 - r0, c0:c1 + 1] *= f
-                sig = (dn ** 2 - noise) / A(rows) ** 2
-                valid = dn > 0
-                sig = np.where(valid, sig, 0.0)[:, :W2 * 2]
-                v = valid[:, :W2 * 2]
-                s = sig.reshape(-1, 2, W2, 2).sum((1, 3))
-                c = v.reshape(-1, 2, W2, 2).sum((1, 3))
-                o0 = r0 // 2
-                with np.errstate(invalid='ignore', divide='ignore'):
-                    out[p][o0:o0 + len(s)] = np.where(c >= 2, s / np.maximum(c, 1), np.nan)
-                if p == 'hh':
-                    count[o0:o0 + len(c)] = c
+        noise = _vector_grid(nl, np_, nv, rows80, cols80)
+        for (a0, a1, c0, c1, lines, lut) in az:
+            ri = np.nonzero((rows80 >= a0) & (rows80 <= a1 + 1))[0]
+            ci = np.nonzero((cols80 >= c0) & (cols80 <= c1 + 1))[0]
+            if len(ri) and len(ci):
+                f = np.interp(rows80[ri], lines, lut).astype(np.float32)[:, None]
+                noise[ri[0]:ri[-1] + 1, ci[0]:ci[-1] + 1] *= f
+        lin = (dn2 - noise) / (A * A)
+        del noise, A, dn2
+        if count is None:
+            count = cnt
 
-        lin = out[p]
         bad = ~(lin > 0) & np.isfinite(lin)
         if bad.any():
             filled = np.where(np.isfinite(lin), lin, 0.0)
-            w = uniform_filter(np.isfinite(lin).astype(np.float64), 9)
+            w = uniform_filter(np.isfinite(lin).astype(np.float32), 9)
             mean = uniform_filter(filled, 9) / np.maximum(w, 1e-9)
             lin = np.where(bad & (mean > 0), mean, lin)
             lin = np.where(np.isfinite(lin) & ~(lin > 0), 10 ** (FLOOR_DB / 10), lin)
-        replaced[p] = float(bad.sum() / max(np.isfinite(out[p]).sum(), 1))
+        replaced[p] = float(bad.sum() / max(np.isfinite(lin).sum(), 1))
         with np.errstate(divide='ignore', invalid='ignore'):
             out[p] = (10 * np.log10(lin)).astype(np.float32)
 
     valid = (count >= 2) & np.isfinite(out['hh']) & np.isfinite(out['hv'])
     lines, pixels, g = _tie_points(ann['hh'])
-    rows80, cols80 = np.arange(H2) * 2 + 0.5, np.arange(W2) * 2 + 0.5
-    inc = RegularGridInterpolator((lines, pixels), g[..., 5], bounds_error=False, fill_value=None)
-    rr, cc = np.meshgrid(rows80, cols80, indexing='ij')
-    incidence = inc(np.stack([rr.ravel(), cc.ravel()], 1)).reshape(H2, W2).astype(np.float32)
+    incidence = RectBivariateSpline(lines, pixels, g[..., 5], kx=1, ky=1)(rows80, cols80).astype(np.float32)
 
     gi = ann['hh'].find('.//generalAnnotation/productInformation')
     hdr = ann['hh'].find('.//adsHeader')
