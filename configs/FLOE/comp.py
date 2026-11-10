@@ -16,5 +16,6 @@ train_options = {
         w_prop=1.0,
         w_ord=1.0,
         min_bag_pixels=64,
+        max_unknown=0.5,
     ),
 }
