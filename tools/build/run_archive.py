@@ -27,6 +27,14 @@ _INDEX = None
 
 def _init(creds, chart_root):
     global _SESSION, _INDEX
+    try:
+        # the server also trains models: under memory pressure the kernel should kill a build
+        # worker (the frame is redone on restart) rather than a training data loader. A killed
+        # worker's frame never reports back, so the run then waits at the end and needs a restart.
+        with open('/proc/self/oom_score_adj', 'w') as fh:
+            fh.write('1000')
+    except OSError:
+        pass
     _SESSION = asf.EarthdataSession(*creds)
     _INDEX = json.load(open(osp.join(chart_root, 'index.json')))
 
@@ -52,6 +60,9 @@ def _work(args):
                 r['status'] = 'skipped_little_ice'
         return {**r, 'total_seconds': round(time.time() - t0, 1)}
     except Exception as e:
+        for p in (osp.join(a['out'], name + '.nc'), osp.join(a['chart_out'], name + '.chart.h5')):
+            if osp.exists(p):                     # a half-finished scene must not look built
+                os.remove(p)
         return {'product': name, 'status': 'error', 'error': repr(e), 'trace': traceback.format_exc()[-1500:]}
     finally:
         if osp.exists(zp) and not a['keep_zips']:
@@ -82,7 +93,7 @@ def main():
     if osp.exists(log_path):
         for line in open(log_path):
             r = json.loads(line)
-            if r['status'] in ('ok', 'skipped_little_ice', 'no_chart'):
+            if r['status'] in ('ok', 'skipped_little_ice', 'no_chart', 'no_polygons'):
                 done.add(r['product'])
     todo = [n for n in sorted(frames) if n not in done and not osp.exists(osp.join(args.out, n + '.nc'))]
     if args.limit:

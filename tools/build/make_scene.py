@@ -77,6 +77,8 @@ def build_one(zip_path, chart_root, index, out_dir, chart_out, max_minutes):
     poly[~sc.valid] = -1
 
     P = len(table)
+    if not P or not (poly >= 0).any():
+        return {'product': sc.name, 'status': 'no_polygons', 'charts': chart_names}
     sic_t = np.array([t[2] for t in table], np.uint8)
     sod_t = np.array([t[3] for t in table], np.uint8)
     floe_t = np.array([t[4] for t in table], np.uint8)
