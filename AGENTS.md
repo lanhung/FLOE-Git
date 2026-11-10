@@ -1,6 +1,7 @@
 # FLOE-Git 工作约定
 
-- 范围：基线、PGSG 及对照、AutoICE 基准、五折评估与论文。数据构建源码不在仓库内。
+- 范围：基线、PGSG 及对照、AutoICE 基准、五折评估、论文与数据集重建（`tools/build`）。
+- `preprocessing/` 是原作者生成旧档案的脚本，只作来源追溯，不运行；审查结论见 `docs/DATA_PIPELINE_AUDIT.md`。
 - 论文实验只用分组五折（`datalists/cv5/`，`tools.train --fold K`）。375/42 名单（`train_417`/`val_417`）有相邻帧泄漏，只作冒烟。
 - 本地只编辑与静态检查；训练、评估与 Python 检查在服务器的 `ice-binary` 环境运行（`source tools/system/floe_env.sh`）。服务器多人共用，只在 `/root/autodl-tmp/WannianLi/FLOE/` 内读写。
 - 数据路径来自环境变量（`FLOE_DATA_DIR`、`FLOE_TILE_INDEX`、`FLOE_A4A_DIR` 等），由 `floe_env.sh` 设置。
