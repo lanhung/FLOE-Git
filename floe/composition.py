@@ -98,7 +98,7 @@ class CompositionLoss(nn.Module):
     """
 
     def __init__(self, Q, U, pure_threshold=0.9, w_prop=1.0, w_ord=1.0,
-                 min_pixels=64, full_weight_pixels=4096, max_unknown=0.5):
+                 min_pixels=64, full_weight_pixels=4096, max_unknown=0.5, ice_only=False):
         super().__init__()
         Q = torch.as_tensor(Q, dtype=torch.float32)
         U = torch.as_tensor(U, dtype=torch.float32)
@@ -108,6 +108,11 @@ class CompositionLoss(nn.Module):
         pure = (top >= pure_threshold) & (U <= 1 - pure_threshold)
         self.register_buffer('pure_class', torch.where(pure, arg, torch.full_like(arg, -1)))
         self.w_prop, self.w_ord = w_prop, w_ord
+        # ice_only: match only the floe-size mix of the ice, not the open-water share
+        # (1 - CT). The water share of a 9/10 polygon says nothing about where the leads
+        # are, and fitting it teaches the model to put water inside pack ice; water vs ice
+        # is then left to the pixel CE (use with hard_ce='all').
+        self.ice_only = ice_only
         self.min_pixels, self.full_weight_pixels = min_pixels, full_weight_pixels
         # polygons that are mostly unknown ice (fast ice, bergs, undetermined form) would
         # only feed the model its own guess back, so they are left out
@@ -145,14 +150,21 @@ class CompositionLoss(nn.Module):
 
         w = (cnt / self.full_weight_pixels).clamp(max=1.0)
         w = w / w.sum()
-        l_prop = -(target * torch.log(pbar.clamp_min(1e-6))).sum(1)
 
-        # ordinal term on the ice-conditional distributions, weighted by ice fraction
+        # ice-conditional distributions (floe-size mix of the ice alone)
         ice_t = target[:, ICE]
         ice_frac = ice_t.sum(1)
-        cdf_t = torch.cumsum(ice_t / ice_frac[:, None].clamp_min(1e-6), 1)[:, :-1]
+        cond_t = ice_t / ice_frac[:, None].clamp_min(1e-6)
         ice_p = pbar[:, ICE]
-        cdf_p = torch.cumsum(ice_p / ice_p.sum(1, keepdim=True).clamp_min(1e-6), 1)[:, :-1]
+        cond_p = ice_p / ice_p.sum(1, keepdim=True).clamp_min(1e-6)
+        if self.ice_only:
+            l_prop = -(cond_t * torch.log(cond_p.clamp_min(1e-6))).sum(1) * ice_frac
+        else:
+            l_prop = -(target * torch.log(pbar.clamp_min(1e-6))).sum(1)
+
+        # ordinal term on the ice-conditional distributions, weighted by ice fraction
+        cdf_t = torch.cumsum(cond_t, 1)[:, :-1]
+        cdf_p = torch.cumsum(cond_p, 1)[:, :-1]
         l_ord = ((cdf_p - cdf_t) ** 2).sum(1) * ice_frac
 
         loss = (w * (self.w_prop * l_prop + self.w_ord * l_ord)).sum()
