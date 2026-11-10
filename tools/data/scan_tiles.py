@@ -49,6 +49,9 @@ def parse_args():
                    help='训练 patch 边长，必须与 config 的 patch_size 一致（决定裁剪覆盖核）')
     p.add_argument('--workers', type=int, default=16)
     p.add_argument('--limit', type=int, default=None, help='只扫前 N 景（调试用）')
+    p.add_argument('--lists', nargs='*', default=None,
+                   help='only scan the scenes named in these datalist JSON files '
+                        '(e.g. while the archive is still being built)')
     return p.parse_args()
 
 
@@ -120,6 +123,12 @@ def scan_one(job):
 def main():
     args = parse_args()
     files = sorted(f for f in os.listdir(args.data_dir) if f.endswith('.nc'))
+    if args.lists:
+        import json
+        wanted = set()
+        for path in args.lists:
+            wanted.update(json.load(open(path)))
+        files = [f for f in files if f in wanted]
     if args.limit:
         files = files[:args.limit]
     print(f'Found {len(files)} .nc scenes in {args.data_dir}')

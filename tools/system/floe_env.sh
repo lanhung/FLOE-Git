@@ -15,6 +15,11 @@ export FLOE_A4A_TILE_INDEX=${FLOE_A4A_TILE_INDEX:-$FLOE_ROOT/ai4arctic/floe_tile
 export FLOE_POOL_DIR=${FLOE_POOL_DIR:-$FLOE_ROOT/pooled}            # symlinks to both archives
 export FLOE_POOL_TILE_INDEX=${FLOE_POOL_TILE_INDEX:-$FLOE_ROOT/pooled_tile_index.npz}
 export FLOE_CHART_DIR=${FLOE_CHART_DIR:-$FLOE_ROOT/charts}           # <scene>.chart.h5 (egg-code compositions)
+# Rebuilt archive (tools/build): scenes, composition sidecars, grouped split, tile index
+export FLOE_V2_DIR=${FLOE_V2_DIR:-$FLOE_ROOT/data_v2}
+export FLOE_V2_CHART_DIR=${FLOE_V2_CHART_DIR:-$FLOE_ROOT/charts_v2}
+export FLOE_V2_SPLIT=${FLOE_V2_SPLIT:-datalists/v2_2023}
+export FLOE_V2_TILE_INDEX=${FLOE_V2_TILE_INDEX:-$FLOE_ROOT/index/v2_2023_tile_index.npz}
 export FLOE_FIG_DIR=${FLOE_FIG_DIR:-$FLOE_ROOT/figs}
 export FLOE_LOG_DIR=${FLOE_LOG_DIR:-$FLOE_ROOT/logs}
 # huggingface.co is not reachable from this server; the mirror is.
