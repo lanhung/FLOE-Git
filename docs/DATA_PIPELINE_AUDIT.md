@@ -46,13 +46,32 @@ The replacement is `tools/build` (AI4Arctic-style processing, see the end of thi
    *Measured* (`tools.build.pair`, 2023): only 57 of the archive's 102 scenes from 2023 have a DMI
    chart within 30 min of the image; the other 45 were labelled from a chart of another pass or
    day. Example: S1A_..._20230302T201210 (20:12 UTC) has no DMI chart that evening; the nearest
-   charts of that area are 10.5 h before and 24.5 h after.
+   charts of that area are 10.5 h before and 24.5 h after. Over the whole archive
+   (`tools.build.audit_old`, all 417 scenes against the CDSE footprints): 193 scenes (46 %) have
+   a DMI chart within 30 min that overlaps them.
 7. **Class-specific thresholds that remove big and vast floe.** `floe_label.py:17-23`: cake,
    small and medium need CT >= 6/10 and dominance >= 0.65, but big and vast need CT >= 9/10 and
    dominance >= 0.9. AutoICE uses 0.65 for every class and no CT condition. In the mixed East
    Greenland pack big/vast polygons rarely reach 9/10 and 90 %, which is consistent with the
    archive's 398 East Greenland scenes containing no big or vast pixel at all while the DMI charts
-   for 2022 already contain big and vast polygons (`tools.build.audit_old` quantifies this per scene).
+   for 2022 already contain big and vast polygons.
+   *Measured* (`tools.build.audit_old`, `logs/audit_old.csv` on the server): in the 193 scenes
+   that have a same-pass DMI chart, the charts clipped to the scene footprint give (per-scene shares averaged over scenes)
+
+   | class | archive labels | chart, dominant class (AutoICE rule) | chart, egg-code composition |
+   |---|---|---|---|
+   | water | 0.847 | 0.655 | 0.685 |
+   | cake | 0.016 | 0.046 | 0.032 |
+   | small | 0.053 | 0.078 | 0.058 |
+   | medium | 0.085 | 0.057 | 0.058 |
+   | big | 0.000 | 0.037 | 0.058 |
+   | vast | 0.000 | 0.065 | 0.053 |
+
+   In 56 of these scenes the chart has more than 2 % big or vast while the archive has none.
+   The archive shares are those of its labelled tiles; the chart shares are polygon areas inside
+   the footprint, leaving out masked polygons (dominant class) or the unknown mass of fast ice,
+   bergs and undetermined forms (composition). The two are therefore not measured on identical
+   pixels, but the absence of big and vast does not depend on that.
 8. **Scene selection by class.** `prescreen_dmi_charts.py:48-49` keeps only chart dates with
    small/medium (`FLOE_PS_CLASSES=2,3`), and `make_labels.py:55` can drop whole classes
    (`KEEP_ONLY_TARGET`). Both bias class frequencies and must be reported if kept.
