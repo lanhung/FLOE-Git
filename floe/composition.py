@@ -17,7 +17,7 @@ bergs) is "unknown" mass: it is assigned to the ice classes in proportion to the
 current prediction, so it neither rewards nor penalises any ice class.
 
 Polygon ids reach the loss as a label channel ('_bag', global id per training polygon,
--1 = none); see AI4ArcticChallengeDataset and tools/data/build_composition.py.
+-1 = none); see AI4ArcticChallengeDataset and tools/build/make_scene.py.
 """
 import numpy as np
 import torch

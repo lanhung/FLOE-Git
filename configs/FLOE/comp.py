@@ -1,7 +1,7 @@
 # Chart-composition supervision on top of the baseline (a): polygon-level proportion
 # loss plus an ordinal loss on the cumulative floe-size distribution, pixel CE only in
 # pure polygons (one class >= 0.9). Needs $FLOE_CHART_DIR/<scene>.chart.h5 for every
-# training scene (tools/data/build_composition.py). See floe/composition.py.
+# training scene (tools/build/make_scene.py). See floe/composition.py.
 import os
 
 _base_ = ['./sota_segformer_in1k_dlr_417.py']

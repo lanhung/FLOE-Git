@@ -28,7 +28,7 @@ import numpy as np
 import requests
 
 BASE = 'https://download.dmi.dk/public/ICESERVICE/SIGRID3'
-EXTS = ('shp', 'shx', 'dbf', 'prj', 'cpg')
+EXTS = ('shp', 'shx', 'dbf', 'prj')
 NAME_RE = re.compile(r'^(\d{12})_([A-Za-z]+)_RIC$')
 
 MASK = 255
@@ -77,7 +77,7 @@ def _fetch_chart(year, name, out, sess):
     return True
 
 
-def fetch(years, out, workers=8):
+def fetch(years, out, workers=16):
     from concurrent.futures import ThreadPoolExecutor
     sess = requests.Session()
     sess.mount('https://', requests.adapters.HTTPAdapter(pool_maxsize=workers))
