@@ -26,7 +26,8 @@
 #   $FLOE_ROOT/work_dir/floe_<tag>_cv5f<K>_s<seed>/   (checkpoint, offline wandb)
 #   $FLOE_LOG_DIR/floe_<tag>_cv5f<K>_s<seed>.log     (train + eval log, EXIT= lines)
 #   $FLOE_CM_DIR/cv5/<tag>_s<seed>_f<K>.npz          (per-scene CM for paired_cv)
-#   $FLOE_CM_DIR/a4a/<tag>_s<seed>_f<K>_test.npz     (v0 res80, pooled: AutoICE test scenes)
+#   $FLOE_CM_DIR/a4a/<cv5|v2>_<tag>_s<seed>_f<K>_test.npz  (AutoICE test scenes: v0 res80 and
+#                                                     pooled, all v2 tags)
 #   $FLOE_CM_DIR/poly/<tag>_s<seed>_f<K>.npz         (per-polygon histograms, if $FLOE_CHART_DIR exists)
 # Refuses to start if a fold scene is missing or partial, the GPU is busy, or the
 # run directory already exists (no silent overwrite or resume).
@@ -55,10 +56,12 @@ declare -A CFG=(
 # No-GLCM models are also scored on the 20 AutoICE test scenes, which
 # tools.data.convert_ai4arctic standardised to this archive's z-scores.
 declare -A XEVAL=([res80]=1 [pooled]=1)
+XCFG=configs/AI4Arctic/a4a_baseline.py
 SPLIT=datalists/cv5; DATA_DIR=$FLOE_DATA_DIR; CHART_DIR=$FLOE_CHART_DIR; RUNK=cv5f; CMSUB=cv5; SESS=floe
 if [ "$ARCHIVE" = v2 ]; then
   CFG=([baseline]=configs/V2/baseline.py [comp]=configs/V2/comp.py [comp_noord]=configs/V2/comp_noord.py)
-  XEVAL=()
+  XEVAL=([baseline]=1 [comp]=1 [comp_noord]=1)        # AutoICE test in AutoICE z-scores
+  XCFG=configs/AI4Arctic/a4a_v2.py
   SPLIT=$FLOE_V2_SPLIT; DATA_DIR=$FLOE_V2_DIR; CHART_DIR=$FLOE_V2_CHART_DIR; RUNK=v2f; CMSUB=v2; SESS=floe-v2
 fi
 TRAIN_LIST=$SPLIT/fold${FOLD}_train.json
@@ -93,8 +96,8 @@ for pair in "$@"; do
   CM=$FLOE_CM_DIR/$CMSUB/${TAG}_s${SEED}_f${FOLD}.npz
   XCMD=true
   if [ -n "${XEVAL[$TAG]:-}" ]; then
-    XCMD="python -m tools.evaluate --config configs/AI4Arctic/a4a_baseline.py --checkpoint $WD/best_model_$RUN.pth \
-          --val-list datalists/ai4arctic/test.json --dump-cm $FLOE_CM_DIR/a4a/${TAG}_s${SEED}_f${FOLD}_test.npz \
+    XCMD="python -m tools.evaluate --config $XCFG --checkpoint $WD/best_model_$RUN.pth \
+          --val-list datalists/ai4arctic/test.json --dump-cm $FLOE_CM_DIR/a4a/${CMSUB}_${TAG}_s${SEED}_f${FOLD}_test.npz \
           --output-dir $WD/eval_a4a_test; echo EXIT_EVAL_A4A=\$?"
   fi
   if [ -e "$WD" ]; then echo "[launch] $RUN: $WD exists, skipping"; continue; fi
