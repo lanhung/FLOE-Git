@@ -71,7 +71,7 @@ def parse_args():
                              '按 target_chart）。全局 CM = cm.sum(0)，与本脚本打印的全局指标同源。'
                              '供 tools.analysis.scene_cm / paired_cv 使用。')
     parser.add_argument('--composition-dir', type=pathlib.Path, default=None,
-                        help='chart sidecars (<scene>.chart.h5, tools.data.build_composition): '
+                        help='chart sidecars (<scene>.chart.h5, tools.build.make_scene): '
                              'also score predicted class fractions per ice-chart polygon')
     parser.add_argument('--dump-polygons', type=pathlib.Path, default=None,
                         help='with --composition-dir: save per-polygon predicted histograms and '
