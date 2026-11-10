@@ -7,7 +7,7 @@ export PYTHONNOUSERSITE=1
 # 2^-10 z-unit grid, labels/mask bit-exact, zstd). FLOE_DATA_ORIG is the original.
 export FLOE_DATA_ORIG=${FLOE_DATA_ORIG:-$FLOE_ROOT/Data/FLOE_datanc}
 export FLOE_DATA_DIR=${FLOE_DATA_DIR:-$FLOE_ROOT/data_q10}
-export FLOE_TILE_INDEX=${FLOE_TILE_INDEX:-$FLOE_ROOT/Data/floe_tile_index_417.npz}
+export FLOE_TILE_INDEX=${FLOE_TILE_INDEX:-$FLOE_ROOT/index/floe_tile_index_417.npz}   # rebuilt from data_q10, same tiles
 export FLOE_CM_DIR=${FLOE_CM_DIR:-$FLOE_ROOT/cm}
 # AI4Arctic / AutoICE benchmark in FLOE format (tools.data.convert_ai4arctic)
 export FLOE_A4A_DIR=${FLOE_A4A_DIR:-$FLOE_ROOT/ai4arctic/floe_format}

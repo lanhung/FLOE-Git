@@ -176,9 +176,9 @@ def process(zip_path, block=1024):
 
     gi = ann['hh'].find('.//generalAnnotation/productInformation')
     hdr = ann['hh'].find('.//adsHeader')
-    meta = {'product': name, 'ipf': ipf, 'mission': hdr.findtext('missionId'),
-            'start': hdr.findtext('startTime'), 'stop': hdr.findtext('stopTime'),
-            'pass': gi.findtext('pass') if gi is not None else '',
+    meta = {'product': str(name), 'ipf': str(ipf), 'mission': str(hdr.findtext('missionId')),
+            'start': str(hdr.findtext('startTime')), 'stop': str(hdr.findtext('stopTime')),
+            'pass': str(gi.findtext('pass')) if gi is not None else '',
             'native_shape': (H, W), 'nonpositive_replaced': replaced}
     geo = {'line': (lines - 0.5) / 2, 'pixel': (pixels - 0.5) / 2,      # in 80 m pixel units
            'lat': g[..., 2], 'lon': g[..., 3], 'height': g[..., 4], 'inc': g[..., 5]}

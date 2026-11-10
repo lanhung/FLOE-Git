@@ -147,7 +147,7 @@ def build_one(zip_path, chart_root, index, out_dir, chart_out, max_minutes):
         f.attrs['label_rules'] = ('AutoICE: CA:=CT for single type, same-class partials summed, '
                                   'dominance >= 0.65 of CT, FLOE masked if any partial is fast ice, '
                                   'water polygons 0; range codes -> midpoint; DMI pancake (0) masked')
-        f.attrs['chart_fit_rms_px'] = rms
+        f.attrs['georef_heldout_err_px'] = rms
         f.attrs['nonpositive_replaced'] = json.dumps(sc.meta['nonpositive_replaced'])
         f.attrs['built_by'] = VERSION
     os.replace(tmp, dst)
@@ -170,7 +170,7 @@ def build_one(zip_path, chart_root, index, out_dir, chart_out, max_minutes):
     os.replace(side + '.tmp', side)
     return {'product': sc.name, 'status': 'ok', 'charts': chart_names,
             'dt_minutes': [r['dt_minutes'] for r in matched], 'shape': list(shape),
-            'coverage': coverage, 'polygons': int(len(used)), 'fit_rms_px': rms,
+            'coverage': coverage, 'polygons': int(len(used)), 'georef_err_px': rms,
             'floe_hist': floe_hist, 'nonpositive_replaced': sc.meta['nonpositive_replaced'],
             'ipf': sc.meta['ipf'], 'seconds': round(time.time() - t0, 1)}
 
@@ -180,7 +180,11 @@ def _job(args):
     try:
         return build_one(zp, chart_root, index, out_dir, chart_out, max_minutes)
     except Exception as e:
-        return {'product': osp.basename(zp)[:-4], 'status': 'error', 'error': repr(e),
+        name = osp.basename(zp)[:-4]
+        for tmp in (osp.join(out_dir, name + '.nc.tmp'), osp.join(chart_out, name + '.chart.h5.tmp')):
+            if osp.exists(tmp):
+                os.remove(tmp)
+        return {'product': name, 'status': 'error', 'error': repr(e),
                 'trace': traceback.format_exc()[-2000:]}
 
 
@@ -208,7 +212,7 @@ def main():
                                              args.max_minutes) for z in todo]):
             log.write(json.dumps(r) + '\n'); log.flush()
             print(f"{r['status']:8s} {r['product']} {r.get('charts', '')} "
-                  f"cov={r.get('coverage', 0):.2f} rms={r.get('fit_rms_px', 0):.2f}px "
+                  f"cov={r.get('coverage', 0):.2f} georef={r.get('georef_err_px', 0):.2f}px "
                   f"{r.get('seconds', '')}s {r.get('error', '')}", flush=True)
 
 
