@@ -255,7 +255,8 @@ def train(cfg, train_options, net, device, dataloader_train, dataloader_val, opt
         comp_loss = CompositionLoss(
             _ds.bag_Q, _ds.bag_U, pure_threshold=comp_cfg.get('pure_threshold', 0.9),
             w_prop=comp_cfg.get('w_prop', 1.0), w_ord=comp_cfg.get('w_ord', 1.0),
-            min_pixels=comp_cfg.get('min_bag_pixels', 64)).to(device)
+            min_pixels=comp_cfg.get('min_bag_pixels', 64),
+            max_unknown=comp_cfg.get('max_unknown', 0.5)).to(device)
         comp_weight = float(comp_cfg.get('weight', 1.0))
         comp_hard = comp_cfg.get('hard_ce', 'pure')
         assert comp_hard in ('pure', 'all', 'none'), comp_hard

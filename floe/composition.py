@@ -98,7 +98,7 @@ class CompositionLoss(nn.Module):
     """
 
     def __init__(self, Q, U, pure_threshold=0.9, w_prop=1.0, w_ord=1.0,
-                 min_pixels=64, full_weight_pixels=4096):
+                 min_pixels=64, full_weight_pixels=4096, max_unknown=0.5):
         super().__init__()
         Q = torch.as_tensor(Q, dtype=torch.float32)
         U = torch.as_tensor(U, dtype=torch.float32)
@@ -109,6 +109,9 @@ class CompositionLoss(nn.Module):
         self.register_buffer('pure_class', torch.where(pure, arg, torch.full_like(arg, -1)))
         self.w_prop, self.w_ord = w_prop, w_ord
         self.min_pixels, self.full_weight_pixels = min_pixels, full_weight_pixels
+        # polygons that are mostly unknown ice (fast ice, bergs, undetermined form) would
+        # only feed the model its own guess back, so they are left out
+        self.register_buffer('usable', U <= max_unknown)
 
     def pure_only(self, y, bag):
         """Labels with every pixel outside a pure polygon set to 255."""
@@ -126,7 +129,7 @@ class CompositionLoss(nn.Module):
         p = torch.softmax(logits.float(), dim=1).permute(0, 2, 3, 1)[has]   # [N, 6]
         ids, inv, cnt = torch.unique(bag[has], return_inverse=True, return_counts=True)
         S = torch.zeros(len(ids), p.shape[1], device=p.device).index_add_(0, inv, p)
-        keep = cnt >= self.min_pixels
+        keep = (cnt >= self.min_pixels) & self.usable[ids]
         if not bool(keep.any()):
             zero = logits.sum() * 0.0
             return zero, {'bags': 0}
