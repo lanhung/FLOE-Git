@@ -1,0 +1,22 @@
+# Validation folds of the 15 benchmark baselines evaluated again without the tile gate, for the
+# composition column of Table 7 (row "five folds -> held-out fold"). The polygon dumps written by
+# launch_fold.sh (poly/v2bench/) were made with the gate on: tiles whose labels are all masked predict
+# class 0, so the masked (mixed) polygons are scored as water there. This queue writes
+#   $FLOE_CM_DIR/v2bench_full/baseline_s<seed>_f<K>.npz, $FLOE_CM_DIR/poly/v2bench_full/baseline_s<seed>_f<K>.npz
+# (tools/system/eval_bench.sh valpoly; validation scenes only, no 2026 scene). Each entry waits for its run.
+#   tmux new -d -s floe-queue-valpoly "STAGGER_MIN=5 bash tools/system/run_queue.sh tools/system/queues/v2_bench_valpoly.txt"
+done:floe_baseline_v2benchf0_s42 | bash tools/system/eval_bench.sh valpoly 0 42 {GPU}
+done:floe_baseline_v2benchf1_s42 | bash tools/system/eval_bench.sh valpoly 1 42 {GPU}
+done:floe_baseline_v2benchf2_s42 | bash tools/system/eval_bench.sh valpoly 2 42 {GPU}
+done:floe_baseline_v2benchf3_s42 | bash tools/system/eval_bench.sh valpoly 3 42 {GPU}
+done:floe_baseline_v2benchf4_s42 | bash tools/system/eval_bench.sh valpoly 4 42 {GPU}
+done:floe_baseline_v2benchf0_s43 | bash tools/system/eval_bench.sh valpoly 0 43 {GPU}
+done:floe_baseline_v2benchf1_s43 | bash tools/system/eval_bench.sh valpoly 1 43 {GPU}
+done:floe_baseline_v2benchf2_s43 | bash tools/system/eval_bench.sh valpoly 2 43 {GPU}
+done:floe_baseline_v2benchf3_s43 | bash tools/system/eval_bench.sh valpoly 3 43 {GPU}
+done:floe_baseline_v2benchf4_s43 | bash tools/system/eval_bench.sh valpoly 4 43 {GPU}
+done:floe_baseline_v2benchf0_s44 | bash tools/system/eval_bench.sh valpoly 0 44 {GPU}
+done:floe_baseline_v2benchf1_s44 | bash tools/system/eval_bench.sh valpoly 1 44 {GPU}
+done:floe_baseline_v2benchf2_s44 | bash tools/system/eval_bench.sh valpoly 2 44 {GPU}
+done:floe_baseline_v2benchf3_s44 | bash tools/system/eval_bench.sh valpoly 3 44 {GPU}
+done:floe_baseline_v2benchf4_s44 | bash tools/system/eval_bench.sh valpoly 4 44 {GPU}

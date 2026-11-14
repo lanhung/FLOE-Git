@@ -19,8 +19,14 @@
 #   comp_allce configs/FLOE/comp_allce.py                     comp with CE on all polygons
 #
 # FLOE_ARCHIVE=v2 runs on the rebuilt archive instead (tools/build): tags baseline, comp,
-# comp_noord, comp_aux, pgsg, pooled -> configs/V2/*.py, folds from $FLOE_V2_SPLIT, runs named
-# floe_<tag>_v2f<K>_s<seed>, CMs under $FLOE_CM_DIR/v2/.
+# comp_noord, comp_aux, pgsg, pooled, multitask -> configs/V2/*.py, folds from $FLOE_V2_SPLIT, runs named
+# floe_<tag>_v2f<K>_s<seed>, CMs under $FLOE_CM_DIR/v2/. Runs on another split of the same
+# archive set FLOE_V2_SPLIT and a name of their own, FLOE_V2_NAME (default v2), which
+# replaces "v2" in the run name and in the CM directory.
+#
+# A tmux session does not inherit the caller's environment, so the variables that select
+# the data (FLOE_V2_SPLIT, FLOE_V2_TILE_INDEX, FLOE_V2_POOL_TILE_INDEX) are exported into it
+# explicitly; floe_env.sh would otherwise reset them to their 2023 defaults.
 #
 # Each run gets its own tmux session floe-<tag>-f<K>-s<seed>, writes
 #   $FLOE_ROOT/work_dir/floe_<tag>_cv5f<K>_s<seed>/   (checkpoint, offline wandb)
@@ -31,6 +37,10 @@
 #   $FLOE_CM_DIR/poly/<tag>_s<seed>_f<K>.npz         (per-polygon histograms, if $FLOE_CHART_DIR exists)
 # Refuses to start if a fold scene is missing or partial, the GPU is busy, or the
 # run directory already exists (no silent overwrite or resume).
+#
+# XEVAL_ONLY=1 scores a finished run on the AutoICE test scenes and does nothing else
+# (for runs that were started before this step was part of the launch); log in
+# $FLOE_LOG_DIR/<run>_a4a.log. Refuses a run that has not ended or already has the file.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 source tools/system/floe_env.sh >/dev/null
@@ -56,14 +66,20 @@ declare -A CFG=(
 # No-GLCM models are also scored on the 20 AutoICE test scenes, which
 # tools.data.convert_ai4arctic standardised to this archive's z-scores.
 declare -A XEVAL=([res80]=1 [pooled]=1)
+declare -A XCFGS=()
 XCFG=configs/AI4Arctic/a4a_baseline.py
 SPLIT=datalists/cv5; DATA_DIR=$FLOE_DATA_DIR; CHART_DIR=$FLOE_CHART_DIR; RUNK=cv5f; CMSUB=cv5; SESS=floe
 if [ "$ARCHIVE" = v2 ]; then
   CFG=([baseline]=configs/V2/baseline.py [comp]=configs/V2/comp.py [comp_noord]=configs/V2/comp_noord.py
-       [comp_aux]=configs/V2/comp_aux.py [pgsg]=configs/V2/pgsg.py [pooled]=configs/V2/pooled.py)
-  XEVAL=([baseline]=1 [comp]=1 [comp_noord]=1 [comp_aux]=1 [pgsg]=1 [pooled]=1)        # AutoICE test in AutoICE z-scores
+       [comp_aux]=configs/V2/comp_aux.py [pgsg]=configs/V2/pgsg.py [pooled]=configs/V2/pooled.py
+       [multitask]=configs/V2/multitask.py [multitask_comp]=configs/V2/multitask_comp.py)
+  XEVAL=([baseline]=1 [comp]=1 [comp_noord]=1 [comp_aux]=1 [pgsg]=1 [pooled]=1 [multitask]=1 [multitask_comp]=1)   # AutoICE test in AutoICE z-scores
   XCFG=configs/AI4Arctic/a4a_v2.py
-  SPLIT=$FLOE_V2_SPLIT; DATA_DIR=$FLOE_V2_DIR; CHART_DIR=$FLOE_V2_CHART_DIR; RUNK=v2f; CMSUB=v2; SESS=floe-v2
+  # models with extra modules or heads need their own config for the AutoICE test
+  XCFGS=([pgsg]=configs/AI4Arctic/a4a_v2_pgsg.py [multitask]=configs/AI4Arctic/a4a_v2_multitask.py
+         [multitask_comp]=configs/AI4Arctic/a4a_v2_multitask.py)   # same network as multitask
+  V2NAME=${FLOE_V2_NAME:-v2}
+  SPLIT=$FLOE_V2_SPLIT; DATA_DIR=$FLOE_V2_DIR; CHART_DIR=$FLOE_V2_CHART_DIR; RUNK=${V2NAME}f; CMSUB=$V2NAME; SESS=floe-$V2NAME
 fi
 TRAIN_LIST=$SPLIT/fold${FOLD}_train.json
 VAL_LIST=$SPLIT/fold${FOLD}_val.json
@@ -102,16 +118,35 @@ for pair in "$@"; do
   CM=$FLOE_CM_DIR/$CMSUB/${TAG}_s${SEED}_f${FOLD}.npz
   XCMD=true
   if [ -n "${XEVAL[$TAG]:-}" ]; then
-    XCMD="python -m tools.evaluate --config $XCFG --checkpoint $WD/best_model_$RUN.pth \
+    XCMD="python -m tools.evaluate --config ${XCFGS[$TAG]:-$XCFG} --checkpoint $WD/best_model_$RUN.pth \
           --val-list datalists/ai4arctic/test.json --dump-cm $FLOE_CM_DIR/a4a/${CMSUB}_${TAG}_s${SEED}_f${FOLD}_test.npz \
           --output-dir $WD/eval_a4a_test; echo EXIT_EVAL_A4A=\$?"
   fi
-  if [ -e "$WD" ]; then echo "[launch] $RUN: $WD exists, skipping"; continue; fi
+  if [ -n "${XEVAL_ONLY:-}" ]; then
+    XOUT=$FLOE_CM_DIR/a4a/${CMSUB}_${TAG}_s${SEED}_f${FOLD}_test.npz
+    [ -n "${XEVAL[$TAG]:-}" ] || { echo "[launch] $RUN: tag $TAG has no AutoICE evaluation"; continue; }
+    grep -aq '^\[launch\] .* done$' "$LOG" 2>/dev/null || { echo "[launch] $RUN: not finished, skipping"; continue; }
+    if [ -e "$XOUT" ]; then echo "[launch] $RUN: $XOUT exists, skipping"; continue; fi
+  elif [ -e "$WD" ]; then echo "[launch] $RUN: $WD exists, skipping"; continue; fi
   USED=$(nvidia-smi -i "$GPU" --query-gpu=memory.used --format=csv,noheader,nounits)
   if [ "$USED" -gt 1000 ]; then echo "[launch] $RUN: GPU $GPU busy (${USED} MiB), skipping"; continue; fi
+  if [ -n "${XEVAL_ONLY:-}" ]; then
+    XLOG=${LOG%.log}_a4a.log
+    tmux new-session -d -s "${SESS}-${TAG}-f${FOLD}-s${SEED}-a4a" "
+      source tools/system/floe_env.sh >/dev/null
+      export CUDA_VISIBLE_DEVICES=$GPU
+      {
+        echo \"[launch] \$(date -Is) $RUN, AutoICE test scenes, on GPU $GPU\"
+        $XCMD
+        echo \"[launch] \$(date -Is) done\"
+      } > $XLOG 2>&1"
+    echo "[launch] $RUN: AutoICE test evaluation started on GPU $GPU (log $XLOG)"
+    continue
+  fi
   tmux new-session -d -s "${SESS}-${TAG}-f${FOLD}-s${SEED}" "
     source tools/system/floe_env.sh >/dev/null
     export CUDA_VISIBLE_DEVICES=$GPU FLOE_V2_SPLIT=$FLOE_V2_SPLIT
+    export FLOE_V2_TILE_INDEX=$FLOE_V2_TILE_INDEX FLOE_V2_POOL_TILE_INDEX=$FLOE_V2_POOL_TILE_INDEX
     {
       echo \"[launch] \$(date -Is) $RUN on GPU $GPU, config ${CFG[$TAG]}\"
       python -m tools.train ${CFG[$TAG]} --fold $FOLD --seed $SEED \

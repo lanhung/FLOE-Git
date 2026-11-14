@@ -1,0 +1,10 @@
+# Rebuilt archive, 2023 pilot, fold 0, seed 42. READY | COMMAND. Start only when
+# v2_2026-11b.txt has ended.
+#
+# AutoICE test scores of the two runs that were started before launch_fold.sh evaluated
+# v2 models on the AutoICE test scenes:
+done:floe_baseline_v2f0_s42 | FLOE_ARCHIVE=v2 XEVAL_ONLY=1 bash tools/system/launch_fold.sh 0 42 baseline:{GPU}
+done:floe_comp_v2f0_s42 | FLOE_ARCHIVE=v2 XEVAL_ONLY=1 bash tools/system/launch_fold.sh 0 42 comp:{GPU}
+# The baseline on the leaking variant of fold 0 (tools/build/leak_split.py), to be compared
+# with floe_baseline_v2f0_s42 on the same validation scenes:
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_2023_leak FLOE_V2_NAME=v2leak bash tools/system/launch_fold.sh 0 42 baseline:{GPU}

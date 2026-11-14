@@ -1,0 +1,6 @@
+# Seed repeats of the leaking-variant baseline (fold 0, 2023 scenes), so that the leakage
+# effect (tools.analysis.leak_effect) is not read from one seed: seed 42 gave +0.052 mIoU on
+# exposed scenes but also +0.031 on the 12 control scenes. Seeds fixed here before the runs;
+# compared with the grouped baselines of the same seeds (queue v2_2026-11d).
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_2023_leak FLOE_V2_NAME=v2leak bash tools/system/launch_fold.sh 0 43 baseline:{GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_2023_leak FLOE_V2_NAME=v2leak bash tools/system/launch_fold.sh 0 44 baseline:{GPU}

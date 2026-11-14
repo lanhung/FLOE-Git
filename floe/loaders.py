@@ -1556,6 +1556,10 @@ class AI4ArcticChallengeTestDataset(Dataset):
             chunk = (first.chunks[-1] if first.chunks else patch_size)
             need = _need_chunk_grid(y, self.options['class_fill_values'], charts,
                                     H, W, patch_size, chunk)
+            if not self.options.get('val_tile_gate', True):
+                # Without the tile gate every tile is run, so every chunk must be read (the
+                # *_evalfull configs; the xarray whole-scene path cannot open the v2 files).
+                need = np.ones_like(need, dtype=bool)
 
             # 3. 一次性分配所有通道，顺序与 prep_scene 一致：变量、month、pol
             n_var = len(variables)

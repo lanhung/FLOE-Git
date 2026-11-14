@@ -6,7 +6,8 @@
 #
 # QUEUE_FILE: one entry per line, "READY | COMMAND", processed strictly in order.
 #   READY   a readiness check: fold<K> (all fold-K scenes converted and readable),
-#           a4a (AutoICE scenes converted and tile index built), or always.
+#           a4a (AutoICE scenes converted and tile index built), done:<run> (the launch
+#           of that run has ended, see launch_fold.sh), or always.
 #   COMMAND run with {GPU} replaced by the first idle GPU (memory.used < 1000 MiB).
 # Lines starting with # are ignored. After each launch the script waits until the
 # run occupies its GPU (max 30 min), then STAGGER_MIN (default 20) minutes, so no
@@ -38,19 +39,29 @@ EOF
   touch "$marker"
 }
 ready_a4a() { [ -f "$FLOE_A4A_TILE_INDEX" ] && [ -f datalists/ai4arctic/test.json ]; }
+ready_done() { grep -aq '^\[launch\] .* done$' "$FLOE_LOG_DIR/$1.log" 2>/dev/null; }
 is_ready() {
   case $1 in
     always) return 0 ;;
     a4a) ready_a4a ;;
+    done:*) ready_done "${1#done:}" ;;
     fold*) ready_fold "${1#fold}" ;;
     *) say "unknown READY '$1'"; return 1 ;;
   esac
 }
-idle_gpu() {
-  nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits | \
-    awk -F', ' '$2 < 1000 {print $1; exit}'
-}
 gpu_mem() { nvidia-smi -i "$1" --query-gpu=memory.used --format=csv,noheader,nounits; }
+# A GPU counts as idle only if it is still below 1000 MiB 90 s later: between the training
+# and the evaluation step of a run the card is empty for a few seconds, and a launch in
+# that gap was refused by launch_fold.sh (GPU busy) and the entry lost (12 Nov 2026).
+idle_gpu() {
+  local g
+  g=$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits | \
+      awk -F', ' '$2 < 1000 {print $1; exit}')
+  [ -n "$g" ] || return 0
+  sleep 90
+  [ "$(gpu_mem "$g")" -lt 1000 ] && echo "$g"
+  return 0
+}
 
 if [ "${2:-}" = "--check" ]; then   # report only, launch nothing
   echo "idle GPUs: $(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits | awk -F', ' '$2 < 1000 {printf "%s ", $1}')"
@@ -65,10 +76,19 @@ say "queue start: $QUEUE"
 grep -v '^\s*#' "$QUEUE" | grep -v '^\s*$' | while IFS='|' read -r READY CMD; do
   READY=$(echo "$READY" | xargs); CMD=$(echo "$CMD" | sed 's/^ *//')
   until is_ready "$READY"; do sleep 600; done
-  GPU=$(idle_gpu)
-  while [ -z "$GPU" ]; do sleep 300; GPU=$(idle_gpu); done
-  say "launch on GPU $GPU: ${CMD//\{GPU\}/$GPU}"
-  bash -c "${CMD//\{GPU\}/$GPU}" < /dev/null 2>&1 | tee -a "$LOG"
+  while true; do
+    GPU=$(idle_gpu)
+    while [ -z "$GPU" ]; do sleep 300; GPU=$(idle_gpu); done
+    say "launch on GPU $GPU: ${CMD//\{GPU\}/$GPU}"
+    OUT=$(bash -c "${CMD//\{GPU\}/$GPU}" < /dev/null 2>&1)
+    echo "$OUT" | tee -a "$LOG"
+    # launch_fold.sh refuses a busy card; keep the entry and try again instead of dropping it
+    if echo "$OUT" | grep -q "GPU $GPU busy"; then
+      say "GPU $GPU was busy at launch; retrying this entry in 5 min"
+      sleep 300; continue
+    fi
+    break
+  done
   for i in $(seq 1 60); do
     [ "$(gpu_mem "$GPU")" -gt 1000 ] && break
     sleep 30

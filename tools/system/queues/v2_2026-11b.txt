@@ -1,0 +1,4 @@
+# Rebuilt archive, 2023 pilot (datalists/v2_2023), fold 0, seed 42: runs added after
+# v2_2026-11.txt was started. READY | COMMAND. Start only when that queue has ended,
+# so that the two do not pick the same idle GPU.
+always | FLOE_ARCHIVE=v2 bash tools/system/launch_fold.sh 0 42 multitask:{GPU}
