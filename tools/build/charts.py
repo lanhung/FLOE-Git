@@ -43,6 +43,19 @@ SOD_CLASS = {80: 0, 81: 1, 82: 1, 83: 2, 84: 2, 85: 2, 86: 4, 87: 3, 88: 3, 89: 
 FLOE_CLASS = {2: 1, 3: 2, 4: 3, 5: 4, 6: 5, 7: 5, 9: 6, 10: 6}
 FAST_ICE = 8
 
+# Charts with a polygon far outside their region, found by screen_extents() and checked by
+# hand (11 Nov 2026). In both the oversized polygon covers none of the chart's other
+# polygons and shares the map frame's corner (117.5 W, about 55 N), which looks like a ring
+# whose orientation was corrected wrongly when the shapefile is read. It would label the
+# open sea outside the chart, or most of the Arctic, with one code. Pairing (match), the
+# scene lists (tools.build.split, tools.build.polygon_table) and the chart comparisons skip
+# them. Two CentralWest charts of 23 and 25 May 2025 also pass the screen; their large
+# polygon is open water over Davis Strait, copied from one chart to the next, and is kept.
+EXCLUDED_CHARTS = {
+    '202206211050_NorthWest_RIC': 'open-water polygon of 1.6e6 km2 reaching 117.5 W and 87 N',
+    '202408170800_North_RIC': 'ice polygon (CT 10/10) over most of the Arctic, 117.5 W to 41 E',
+}
+
 
 # ---------------------------------------------------------------- archive
 
@@ -118,7 +131,26 @@ def build_index(root):
     with open(osp.join(root, 'index.json'), 'w') as fh:
         json.dump(recs, fh, indent=0)
     print(f'{len(recs)} charts indexed -> {osp.join(root, "index.json")}')
+    for name, ratio, bbox in screen_extents(recs):
+        flag = 'excluded' if name in EXCLUDED_CHARTS else 'CHECK BY HAND'
+        print(f'  extent {ratio:.1f}x the median of its region: {name} {bbox} [{flag}]')
     return recs
+
+
+def screen_extents(index, factor=3.0):
+    """Charts whose bounding box (in square degrees) is more than `factor` times the
+    median of their region: candidates for EXCLUDED_CHARTS, to be looked at by hand."""
+    def area(b):
+        return (b[2] - b[0]) * (b[3] - b[1])
+    by = {}
+    for r in index:
+        by.setdefault(r['region'], []).append(r)
+    out = []
+    for recs in by.values():
+        med = float(np.median([area(r['bbox']) for r in recs]))
+        out += [(r['name'], area(r['bbox']) / med, [round(v, 1) for v in r['bbox']])
+                for r in recs if area(r['bbox']) > factor * med]
+    return sorted(out, key=lambda o: -o[1])
 
 
 def match(index, start, stop, footprint, max_minutes=30):
@@ -127,6 +159,8 @@ def match(index, start, stop, footprint, max_minutes=30):
     from shapely.geometry import box
     out = []
     for r in index:
+        if r['name'] in EXCLUDED_CHARTS:
+            continue
         t = datetime.fromisoformat(r['time'])
         dt = 0.0 if start <= t <= stop else min(abs((t - start).total_seconds()),
                                                 abs((t - stop).total_seconds())) / 60
