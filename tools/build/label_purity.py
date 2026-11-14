@@ -11,6 +11,7 @@ the floe-size mix of the ice (water share removed).
 
     python -m tools.build.label_purity --data-dir $FLOE_ROOT/data_v2 \
         --lists datalists/v2_2023/fold0_val.json --out $FLOE_ROOT/logs/label_purity_v2_2023_f0val
+    python -m tools.build.label_purity --table $FLOE_ROOT/logs/polygons_v2.npz --out ...   # whole archive, no rasters
 """
 import argparse
 import json
@@ -24,15 +25,9 @@ import numpy as np
 NAMES = ('water', 'cake', 'small', 'medium', 'big', 'vast')
 
 
-def one(path):
-    with h5py.File(path, 'r') as f:
-        poly = f['polygon_id'][...]
-        lab = f['FLOE'][...]
-        floe = f['poly_floe'][...].astype(np.int64)
-        comp = f['poly_composition'][...].astype(np.float64)
-        unk = f['poly_unknown'][...].astype(np.float64)
-    m = (poly >= 0) & (lab < 6)
-    n = np.bincount(poly[m], minlength=len(floe)).astype(np.float64)
+def implied(n, floe, comp, unk):
+    """Label x implied-class pixel counts of polygons with n labelled pixels each:
+    with the water share of ice polygons, with the ice mix only, and the pixels skipped."""
     full = np.zeros((6, 6))
     ice = np.zeros((6, 6))
     skipped = 0.0
@@ -53,6 +48,17 @@ def one(path):
     return full, ice, skipped
 
 
+def one(path):
+    with h5py.File(path, 'r') as f:
+        poly = f['polygon_id'][...]
+        lab = f['FLOE'][...]
+        floe = f['poly_floe'][...].astype(np.int64)
+        comp = f['poly_composition'][...].astype(np.float64)
+        unk = f['poly_unknown'][...].astype(np.float64)
+    m = (poly >= 0) & (lab < 6)
+    return implied(np.bincount(poly[m], minlength=len(floe)).astype(np.float64), floe, comp, unk)
+
+
 def scores(cm):
     tp = np.diag(cm)
     iou = tp / np.maximum(cm.sum(0) + cm.sum(1) - tp, 1e-12)
@@ -65,19 +71,28 @@ def scores(cm):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
-    ap.add_argument('--data-dir', required=True)
-    ap.add_argument('--lists', nargs='+', required=True)
+    ap.add_argument('--data-dir', help='scene directory (reads the rasters)')
+    ap.add_argument('--table', help='tools.build.polygon_table output, instead of --data-dir')
+    ap.add_argument('--lists', nargs='*', help='datalists to restrict to (required with --data-dir)')
     ap.add_argument('--out', required=True, help='output prefix (.npz)')
     ap.add_argument('--workers', type=int, default=6)
     args = ap.parse_args()
-    names = sorted({n for p in args.lists for n in json.load(open(p))})
-    paths = [osp.join(args.data_dir, n) for n in names]
-    full, ice, skipped = np.zeros((6, 6)), np.zeros((6, 6)), 0.0
-    with Pool(args.workers) as pool:
-        for f, i, s in pool.imap_unordered(one, paths):
-            full += f
-            ice += i
-            skipped += s
+    names = sorted({n for p in args.lists or [] for n in json.load(open(p))})
+    if args.table:
+        t = np.load(args.table)
+        stem = np.array([n + '.nc' for n in t['scenes']])
+        rows = np.isin(stem[t['scene']], names) if names else np.ones(len(t['scene']), bool)
+        names = sorted(set(stem[t['scene'][rows]]))
+        full, ice, skipped = implied(t['labelled'][rows].astype(np.float64), t['floe'][rows].astype(np.int64),
+                                     t['composition'][rows].astype(np.float64), t['unknown'][rows].astype(np.float64))
+    else:
+        paths = [osp.join(args.data_dir, n) for n in names]
+        full, ice, skipped = np.zeros((6, 6)), np.zeros((6, 6)), 0.0
+        with Pool(args.workers) as pool:
+            for f, i, s in pool.imap_unordered(one, paths):
+                full += f
+                ice += i
+                skipped += s
     np.savez(args.out + '.npz', full=full, ice=ice, skipped=skipped, scenes=np.array(names))
     print(f'{len(names)} scenes; {ice.sum() / 1e6:.0f} Mpx labelled with an implied truth, '
           f'{skipped / 1e6:.0f} Mpx skipped (mostly unknown ice)')

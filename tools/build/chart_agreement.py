@@ -12,7 +12,9 @@ between consecutive charts of one area (drift and real change included).
 
 Overlaps where both charts carry the same polygon (shapes within 5 % IoU of each other,
 e.g. copied from the neighbouring chart) are counted separately, because they agree by
-construction and say little about independent judgement.
+construction and say little about independent judgement. Pairs of the same DMI region
+(a chart issued again a few minutes later, or the next chart of that region) are
+reported apart from pairs of neighbouring regions for the same reason.
 
     python -m tools.build.chart_agreement --charts $FLOE_ROOT/raw/dmi \
         --out $FLOE_ROOT/logs/chart_agreement_same_image
@@ -59,8 +61,9 @@ def compare(job):
            'sod': np.zeros((SOD_N, SOD_N)), 'floe_copied': np.zeros((FLOE_N, FLOE_N)),
            'tv': 0.0, 'tv_area': 0.0, 'water_diff': 0.0, 'water_area': 0.0, 'area': 0.0,
            'copied_area': 0.0}
+    kind = 'same_region' if ra['region'] == rb['region'] else 'neighbours'
     if not len(ia):
-        return ra['name'], rb['name'], dt, out
+        return ra['name'], rb['name'], dt, kind, out
     inter = shapely.area(shapely.intersection(ga[ia], gb[ib])) / 1e6        # km2
     union = shapely.area(ga[ia]) / 1e6 + shapely.area(gb[ib]) / 1e6 - inter
     copied = inter / np.maximum(union, 1e-9) > 0.95
@@ -84,7 +87,7 @@ def compare(job):
             if ia_ > 0 and ib_ > 0:
                 out['tv'] += w * 0.5 * np.abs(qa[1:] / ia_ - qb[1:] / ib_).sum()
                 out['tv_area'] += w
-    return ra['name'], rb['name'], dt, out
+    return ra['name'], rb['name'], dt, kind, out
 
 
 def chart_pairs(index, lo, hi):
@@ -121,44 +124,48 @@ def main():
     ap.add_argument('--workers', type=int, default=6)
     args = ap.parse_args()
 
-    index = json.load(open(osp.join(args.charts, 'index.json')))
+    index = [r for r in json.load(open(osp.join(args.charts, 'index.json'))) if r['name'] not in ch.EXCLUDED_CHARTS]
     jobs = list(chart_pairs(index, args.min_minutes, args.max_minutes))
     print(f'{len(index)} charts, {len(jobs)} pairs {args.min_minutes:.0f}-{args.max_minutes:.0f} min '
           'apart with overlapping bounding boxes', flush=True)
-    tot = None
-    rows = []
+    tot = {}
+    rows, pair_floe = [], []
     with Pool(args.workers, initializer=_init, initargs=(args.charts,)) as pool:
-        for na, nb, dt, o in pool.imap_unordered(compare, jobs, chunksize=4):
-            if tot is None:
-                tot = {k: (v.copy() if isinstance(v, np.ndarray) else v) for k, v in o.items()}
+        for na, nb, dt, kind, o in pool.imap_unordered(compare, jobs, chunksize=4):
+            if kind not in tot:
+                tot[kind] = {k: (v.copy() if isinstance(v, np.ndarray) else v) for k, v in o.items()}
             else:
                 for k, v in o.items():
-                    tot[k] = tot[k] + v
+                    tot[kind][k] = tot[kind][k] + v
             if o['area'] + o['copied_area'] > 0:
                 f = o['floe'][:6, :6]
-                rows.append({'chart_a': na, 'chart_b': nb, 'dt_minutes': round(dt, 1),
+                rows.append({'chart_a': na, 'chart_b': nb, 'kind': kind, 'dt_minutes': round(dt, 1),
                              'overlap_km2': round(o['area'], 1), 'copied_km2': round(o['copied_area'], 1),
                              'floe_agree': round(float(np.trace(f) / f.sum()), 4) if f.sum() else ''})
+                pair_floe.append(o['floe'])
 
-    np.savez(args.out + '.npz', **{k: np.asarray(v) for k, v in tot.items()})
+    # pair_floe: one FLOE matrix per row of the csv, for bootstrapping over chart pairs
+    np.savez(args.out + '.npz', pair_floe=np.array(pair_floe), pair_kind=np.array([r['kind'] for r in rows]),
+             **{f'{kind}_{k}': np.asarray(v) for kind, t in tot.items() for k, v in t.items()})
     with open(args.out + '.csv', 'w', newline='') as fh:
         w = csv.DictWriter(fh, fieldnames=list(rows[0]) if rows else ['chart_a'])
         w.writeheader()
         w.writerows(rows)
 
-    print(f'{len(rows)} pairs overlap: {tot["area"]:.0f} km2 drawn separately, '
-          f'{tot["copied_area"]:.0f} km2 the same polygon in both charts')
-    for name, cm, n in (('FLOE', tot['floe'], 6), ('SOD', tot['sod'], SOD_N), ('SIC', tot['sic'], SIC_N)):
-        s = scores(cm, n)
-        print(f'{name}: OA {s["oa"]:.3f}  mIoU {s["miou"]:.3f}  weighted F1 {s["f1_weighted"]:.3f}')
-        if name == 'FLOE':
-            for k in range(6):
-                print(f'   {FLOE_NAMES[k]:7s} IoU {s["iou"][k]:.3f}  area share {s["share"][k]:.3f}')
-    if tot['tv_area']:
-        print(f'floe-size mix of the ice: mean total-variation distance {tot["tv"] / tot["tv_area"]:.3f}; '
-              f'open-water share: mean abs. difference {tot["water_diff"] / max(tot["water_area"], 1e-9):.3f}')
+    for kind, t in sorted(tot.items()):
+        n_pairs = sum(r['kind'] == kind for r in rows)
+        print(f'\n== {kind}: {n_pairs} pairs overlap, {t["area"]:.0f} km2 drawn separately, '
+              f'{t["copied_area"]:.0f} km2 the same polygon in both charts')
+        for name, cm, n in (('FLOE', t['floe'], 6), ('SOD', t['sod'], SOD_N), ('SIC', t['sic'], SIC_N)):
+            s = scores(cm, n)
+            print(f'{name}: OA {s["oa"]:.3f}  mIoU {s["miou"]:.3f}  weighted F1 {s["f1_weighted"]:.3f}')
+            if name == 'FLOE':
+                for k in range(6):
+                    print(f'   {FLOE_NAMES[k]:7s} IoU {s["iou"][k]:.3f}  area share {s["share"][k]:.3f}')
+        if t['tv_area']:
+            print(f'floe-size mix of the ice: mean total-variation distance {t["tv"] / t["tv_area"]:.3f}; '
+                  f'open-water share: mean abs. difference {t["water_diff"] / max(t["water_area"], 1e-9):.3f}')
     print(f'-> {args.out}.npz, {args.out}.csv')
-
 
 if __name__ == '__main__':
     main()

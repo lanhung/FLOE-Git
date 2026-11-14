@@ -13,8 +13,17 @@ inverse class frequency so rare classes count as much as common ones).
     python -m tools.build.split --log $FLOE_ROOT/data_v2/archive_log.jsonl \
         --data-dir $FLOE_ROOT/data_v2 --out datalists/v2 --folds 5
 
-Writes fold<K>_train.json / fold<K>_val.json (file names, as the loaders expect) and
-split_report.md with per-fold class shares and the group size distribution.
+Benchmark split of the data paper (decided 11 Nov 2026, before any model was scored on
+the test year): only scenes whose charts all lie within 5 min of the frame (the
+tolerance of the AutoICE organisers' own pairing), the year 2026 held out as the test
+set, and no training scene from the 14 days before it:
+
+    python -m tools.build.split ... --out datalists/v2_bench --max-gap-minutes 5 \
+        --test-year 2026 --buffer-days 14
+
+Writes fold<K>_train.json / fold<K>_val.json (file names, as the loaders expect),
+test.json when a test year is given, excluded.json with every scene left out and why,
+and split_report.md with per-fold class shares and the group size distribution.
 """
 import argparse
 import json
@@ -43,11 +52,13 @@ class _Union:
 
 
 def load_scenes(log_path, data_dir):
-    """Latest 'ok' record per product whose scene file exists."""
+    """Latest 'ok' record per product whose scene file exists, without scenes that use a
+    chart of charts.EXCLUDED_CHARTS."""
+    from tools.build.charts import EXCLUDED_CHARTS
     rec = {}
     for line in open(log_path):
         r = json.loads(line)
-        if r['status'] == 'ok':
+        if r['status'] == 'ok' and not set(r.get('charts', ())) & set(EXCLUDED_CHARTS):
             rec[r['product']] = r
         else:
             rec.pop(r['product'], None)
@@ -108,11 +119,35 @@ def main():
     ap.add_argument('--folds', type=int, default=5)
     ap.add_argument('--years', type=int, nargs='*', default=None)
     ap.add_argument('--seed', type=int, default=0)
+    ap.add_argument('--max-gap-minutes', type=float, default=None,
+                    help='keep only scenes whose charts all lie within this many minutes of the frame')
+    ap.add_argument('--test-year', type=int, default=None, help='hold this year out as test.json')
+    ap.add_argument('--buffer-days', type=float, default=0.0,
+                    help='drop training scenes this close (days) to the test year')
     args = ap.parse_args()
 
     scenes = load_scenes(args.log, args.data_dir)
     if args.years:
         scenes = {n: r for n, r in scenes.items() if int(n.split('_')[4][:4]) in args.years}
+    excluded = {}
+    if args.max_gap_minutes is not None:
+        for n, r in list(scenes.items()):
+            gap = max(r.get('dt_minutes') or [0.0])
+            if gap > args.max_gap_minutes:
+                excluded[n] = f'chart {gap:.1f} min from the frame'
+                del scenes[n]
+    test = []
+    if args.test_year is not None:
+        lo, hi = datetime(args.test_year, 1, 1), datetime(args.test_year + 1, 1, 1)
+        for n in list(scenes):
+            t = datetime.strptime(n.split('_')[4], '%Y%m%dT%H%M%S')
+            if lo <= t < hi:
+                test.append(n)
+                del scenes[n]
+            elif 0 <= (lo - t).total_seconds() / 86400 < args.buffer_days or \
+                    0 <= (t - hi).total_seconds() / 86400 < args.buffer_days:
+                excluded[n] = f'within {args.buffer_days:g} days of the test year'
+                del scenes[n]
     groups = groups_of(scenes)
     fold_of, fold_h, fold_n = assign(groups, scenes, args.folds, args.seed)
 
@@ -123,11 +158,17 @@ def main():
         json.dump(train, open(osp.join(args.out, f'fold{f}_train.json'), 'w'), indent=1)
         json.dump(val, open(osp.join(args.out, f'fold{f}_val.json'), 'w'), indent=1)
 
+    if args.test_year is not None:
+        json.dump(sorted(n + '.nc' for n in test), open(osp.join(args.out, 'test.json'), 'w'), indent=1)
+    json.dump(dict(sorted(excluded.items())), open(osp.join(args.out, 'excluded.json'), 'w'), indent=1)
+
     sizes = sorted((len(g) for g in groups), reverse=True)
     share = fold_h / np.maximum(fold_h.sum(0, keepdims=True), 1)
     lines = [f'# Grouped {args.folds}-fold split of {osp.basename(osp.normpath(args.data_dir))}', '',
              f'{len(scenes)} scenes in {len(groups)} groups (largest {sizes[:5]}, '
              f'median {int(np.median(sizes))}); built by tools/build/split.py.', '',
+             f'Test year {args.test_year}: {len(test)} scenes. Left out: {len(excluded)} scenes '
+             f'(max gap {args.max_gap_minutes} min, buffer {args.buffer_days:g} days); see excluded.json.', '',
              '| fold | scenes | ' + ' | '.join(f'{c} share' for c in NAMES) + ' | ice Mpx |',
              '|---|---|' + '---|' * len(NAMES) + '---|']
     for f in range(args.folds):
