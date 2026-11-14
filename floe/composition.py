@@ -223,3 +223,68 @@ def composition_metrics(hist, q, u, pure_threshold=0.9, min_pixels=64):
         'n_pure': int(pure.sum()), 'n_mixed': int((~pure).sum()),
     }
     return out
+
+
+def _coupling(t, h):
+    """Most favourable confusion matrix between two class histograms per polygon.
+
+    t, h: [P, K] pixel counts by class (chart, prediction) with equal row sums. The
+    chart does not place the classes inside a polygon, so min(t, h) pixels of each class
+    are taken as agreeing and the surplus on either side is paired in proportion.
+    Returns the [K, K] matrix summed over polygons (rows chart, columns prediction).
+    """
+    same = np.minimum(t, h)
+    rt, rh = t - same, h - same
+    r = rt.sum(1).clip(1e-12)
+    cm = np.einsum('pi,pj->ij', rt / r[:, None], rh)
+    cm[np.diag_indices_from(cm)] += same.sum(0)
+    return cm
+
+
+def composition_confusion(hist, q, u, pure_threshold=0.9, min_pixels=64, max_unknown=0.5):
+    """Confusion matrices of predicted polygon histograms against chart compositions.
+
+    'full'  all 6 classes, water share of ice polygons included (most favourable
+            arrangement inside each polygon, see _coupling); on a pure polygon this is
+            the ordinary pixel confusion matrix.
+    'ice'   floe-size mix of the ice only: prediction and chart are both renormalised
+            over the 5 ice classes and weighted by the chart's ice pixels; [5, 6], the
+            last column holds chart ice in polygons where no ice was predicted.
+    'pure'  ordinary pixel confusion matrix on polygons with one class >= pure_threshold.
+    Polygons smaller than min_pixels or with more than max_unknown unknown mass are left out.
+    """
+    n = hist.sum(1).astype(np.float64)
+    sel = (n >= min_pixels) & (u <= max_unknown) & (q.sum(1) > 0)
+    hist, q, n = hist[sel].astype(np.float64), q[sel].astype(np.float64), n[sel]
+    q = q / q.sum(1, keepdims=True)
+    t = q * n[:, None]
+    full = _coupling(t, hist)
+
+    n_ice = t[:, ICE].sum(1)
+    pred_ice = hist[:, ICE].sum(1)
+    both = (n_ice > 0) & (pred_ice > 0)
+    ti = t[both][:, ICE]
+    hi = hist[both][:, ICE] / pred_ice[both, None] * n_ice[both, None]
+    ice = np.zeros((5, 6))
+    ice[:, :5] = _coupling(ti, hi)
+    ice[:, 5] = t[(n_ice > 0) & (pred_ice == 0)][:, ICE].sum(0)
+
+    is_pure = q.max(1) >= pure_threshold
+    pure = np.zeros((N_CLASSES, N_CLASSES))
+    np.add.at(pure, q[is_pure].argmax(1), hist[is_pure])
+    return {'full': full, 'ice': ice, 'pure': pure, 'polygons': int(sel.sum()), 'pure_polygons': int(is_pure.sum())}
+
+
+def confusion_scores(cm):
+    """Per-class IoU and F1, their means over classes present in the reference (rows),
+    and the reference-weighted F1 (the AutoICE floe score). Extra columns (e.g. the
+    'no ice predicted' column of the ice-only matrix) count as misses."""
+    k = cm.shape[0]
+    tp = np.diag(cm[:, :k])
+    ref, pred = cm.sum(1), cm[:, :k].sum(0)
+    iou = tp / np.maximum(ref + pred - tp, 1e-12)
+    f1 = 2 * tp / np.maximum(ref + pred, 1e-12)
+    present = ref > 0
+    return {'iou': iou, 'f1': f1, 'miou': float(iou[present].mean()),
+            'f1_weighted': float((ref * f1).sum() / max(ref.sum(), 1e-12)),
+            'oa': float(tp.sum() / max(cm.sum(), 1e-12))}
