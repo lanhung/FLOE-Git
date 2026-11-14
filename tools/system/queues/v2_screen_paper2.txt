@@ -1,0 +1,24 @@
+# Paper 2 screening on 2023 fold 0 (paper_method/DECISIONS.md, item 10) and the 2026 score of
+# the AutoICE model (item 3). Runs after the dataset paper's 2026 scoring. Seeds fixed here.
+# 1. new training runs
+always | FLOE_ARCHIVE=v2 bash tools/system/launch_fold.sh 0 43 comp_aux:{GPU}
+always | FLOE_ARCHIVE=v2 bash tools/system/launch_fold.sh 0 44 comp_aux:{GPU}
+always | FLOE_ARCHIVE=v2 bash tools/system/launch_fold.sh 0 42 multitask_comp:{GPU}
+always | FLOE_ARCHIVE=v2 bash tools/system/launch_fold.sh 0 43 multitask_comp:{GPU}
+always | FLOE_ARCHIVE=v2 bash tools/system/launch_fold.sh 0 44 multitask_comp:{GPU}
+# 2. composition scores without the tile gate for the existing 2023 fold-0 models
+always | bash tools/system/eval_bench.sh screen baseline_v2f0_s42 configs/V2/baseline_evalfull.py /root/autodl-tmp/WannianLi/FLOE/work_dir/floe_baseline_v2f0_s42/best_model_floe_baseline_v2f0_s42.pth {GPU}
+always | bash tools/system/eval_bench.sh screen baseline_v2f0_s43 configs/V2/baseline_evalfull.py /root/autodl-tmp/WannianLi/FLOE/work_dir/floe_baseline_v2f0_s43/best_model_floe_baseline_v2f0_s43.pth {GPU}
+always | bash tools/system/eval_bench.sh screen baseline_v2f0_s44 configs/V2/baseline_evalfull.py /root/autodl-tmp/WannianLi/FLOE/work_dir/floe_baseline_v2f0_s44/best_model_floe_baseline_v2f0_s44.pth {GPU}
+always | bash tools/system/eval_bench.sh screen multitask_v2f0_s42 configs/V2/evalfull/multitask.py /root/autodl-tmp/WannianLi/FLOE/work_dir/floe_multitask_v2f0_s42/best_model_floe_multitask_v2f0_s42.pth {GPU}
+always | bash tools/system/eval_bench.sh screen multitask_v2f0_s43 configs/V2/evalfull/multitask.py /root/autodl-tmp/WannianLi/FLOE/work_dir/floe_multitask_v2f0_s43/best_model_floe_multitask_v2f0_s43.pth {GPU}
+always | bash tools/system/eval_bench.sh screen multitask_v2f0_s44 configs/V2/evalfull/multitask.py /root/autodl-tmp/WannianLi/FLOE/work_dir/floe_multitask_v2f0_s44/best_model_floe_multitask_v2f0_s44.pth {GPU}
+always | bash tools/system/eval_bench.sh screen comp_aux_v2f0_s42 configs/V2/evalfull/comp_aux.py /root/autodl-tmp/WannianLi/FLOE/work_dir/floe_comp_aux_v2f0_s42/best_model_floe_comp_aux_v2f0_s42.pth {GPU}
+# 3. the new runs, each once it has ended
+done:floe_comp_aux_v2f0_s43 | bash tools/system/eval_bench.sh screen comp_aux_v2f0_s43 configs/V2/evalfull/comp_aux.py /root/autodl-tmp/WannianLi/FLOE/work_dir/floe_comp_aux_v2f0_s43/best_model_floe_comp_aux_v2f0_s43.pth {GPU}
+done:floe_comp_aux_v2f0_s44 | bash tools/system/eval_bench.sh screen comp_aux_v2f0_s44 configs/V2/evalfull/comp_aux.py /root/autodl-tmp/WannianLi/FLOE/work_dir/floe_comp_aux_v2f0_s44/best_model_floe_comp_aux_v2f0_s44.pth {GPU}
+done:floe_multitask_comp_v2f0_s42 | bash tools/system/eval_bench.sh screen multitask_comp_v2f0_s42 configs/V2/evalfull/multitask_comp.py /root/autodl-tmp/WannianLi/FLOE/work_dir/floe_multitask_comp_v2f0_s42/best_model_floe_multitask_comp_v2f0_s42.pth {GPU}
+done:floe_multitask_comp_v2f0_s43 | bash tools/system/eval_bench.sh screen multitask_comp_v2f0_s43 configs/V2/evalfull/multitask_comp.py /root/autodl-tmp/WannianLi/FLOE/work_dir/floe_multitask_comp_v2f0_s43/best_model_floe_multitask_comp_v2f0_s43.pth {GPU}
+done:floe_multitask_comp_v2f0_s44 | bash tools/system/eval_bench.sh screen multitask_comp_v2f0_s44 configs/V2/evalfull/multitask_comp.py /root/autodl-tmp/WannianLi/FLOE/work_dir/floe_multitask_comp_v2f0_s44/best_model_floe_multitask_comp_v2f0_s44.pth {GPU}
+# 4. Table 7 row 4: the AutoICE model on the 2026 scenes
+done:floe_a4a_v2_s42 | bash tools/system/eval_bench.sh model a4a_v2_s42 configs/V2/evalfull/a4a_v2_on_v2.py /root/autodl-tmp/WannianLi/FLOE/work_dir/floe_a4a_v2_s42/best_model_floe_a4a_v2_s42.pth {GPU}

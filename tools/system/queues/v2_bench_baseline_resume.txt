@@ -1,0 +1,14 @@
+# Resume of v2_bench_baseline.txt (same runs, same seeds, fixed before any run). Restarted on
+# 13 Nov 2026 after a race in run_queue.sh dropped floe_baseline_v2benchf4_s42 and
+# floe_baseline_v2benchf0_s43 (launch refused on a GPU between a run's training and evaluation
+# steps). Already started and not repeated here: f0-f3 of seed 42, f1 of seed 43.
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 4 42 baseline:{GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 0 43 baseline:{GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 2 43 baseline:{GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 3 43 baseline:{GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 4 43 baseline:{GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 0 44 baseline:{GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 1 44 baseline:{GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 2 44 baseline:{GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 3 44 baseline:{GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 4 44 baseline:{GPU}

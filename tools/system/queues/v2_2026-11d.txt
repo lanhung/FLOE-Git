@@ -1,0 +1,9 @@
+# Seed repeats on fold 0 of the 2023 scenes for the baseline and the two configurations
+# that led on validation with seed 42 (multitask, pgsg). Seeds 43 and 44 are fixed here,
+# before any of these runs; every seed is reported, none is dropped.
+always | FLOE_ARCHIVE=v2 bash tools/system/launch_fold.sh 0 43 baseline:{GPU}
+always | FLOE_ARCHIVE=v2 bash tools/system/launch_fold.sh 0 43 multitask:{GPU}
+always | FLOE_ARCHIVE=v2 bash tools/system/launch_fold.sh 0 43 pgsg:{GPU}
+always | FLOE_ARCHIVE=v2 bash tools/system/launch_fold.sh 0 44 baseline:{GPU}
+always | FLOE_ARCHIVE=v2 bash tools/system/launch_fold.sh 0 44 multitask:{GPU}
+always | FLOE_ARCHIVE=v2 bash tools/system/launch_fold.sh 0 44 pgsg:{GPU}

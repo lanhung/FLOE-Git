@@ -1,0 +1,37 @@
+# Held-out year of the dataset paper (paper_dataset, Table 7 rows "2022--2025 -> 2026" and
+# "AutoICE train -> 2026"): the 15 benchmark baselines (configs/V2/baseline.py, datalists/v2_bench,
+# folds 0-4 x seeds 42-44, v2_bench_baseline.txt) scored on the 486 scenes of 2026
+# (datalists/v2_bench/test.json), each writing
+#   $FLOE_CM_DIR/v2bench_test/baseline_s<seed>_f<K>.npz       per-scene CM
+#   $FLOE_CM_DIR/poly/v2bench_test/baseline_s<seed>_f<K>.npz  per-polygon histograms (composition score)
+#   $FLOE_LOG_DIR/floe_baseline_v2benchf<K>_s<seed>_test2026.log  (EXIT_EVAL=, "[launch] ... done")
+# via tools/system/eval_bench.sh (tmux, CUDA_VISIBLE_DEVICES, no tile gate, refuses existing outputs).
+# START ONLY AFTER ALL 15 RUNS HAVE ENDED; eval_bench.sh refuses (exit 3) while any has not, and
+# run_queue.sh would then drop that entry. Check first: bash tools/system/run_queue.sh <this file> --check
+# Every run is scored, none is dropped; nothing seen here feeds back into any choice.
+# Evaluations are short: STAGGER_MIN=5 is enough, e.g.
+#   tmux new -d -s floe-queue-test "STAGGER_MIN=5 bash tools/system/run_queue.sh tools/system/queues/v2_bench_test2026.txt"
+done:floe_baseline_v2benchf0_s42 | bash tools/system/eval_bench.sh test 0 42 {GPU}
+done:floe_baseline_v2benchf1_s42 | bash tools/system/eval_bench.sh test 1 42 {GPU}
+done:floe_baseline_v2benchf2_s42 | bash tools/system/eval_bench.sh test 2 42 {GPU}
+done:floe_baseline_v2benchf3_s42 | bash tools/system/eval_bench.sh test 3 42 {GPU}
+done:floe_baseline_v2benchf4_s42 | bash tools/system/eval_bench.sh test 4 42 {GPU}
+done:floe_baseline_v2benchf0_s43 | bash tools/system/eval_bench.sh test 0 43 {GPU}
+done:floe_baseline_v2benchf1_s43 | bash tools/system/eval_bench.sh test 1 43 {GPU}
+done:floe_baseline_v2benchf2_s43 | bash tools/system/eval_bench.sh test 2 43 {GPU}
+done:floe_baseline_v2benchf3_s43 | bash tools/system/eval_bench.sh test 3 43 {GPU}
+done:floe_baseline_v2benchf4_s43 | bash tools/system/eval_bench.sh test 4 43 {GPU}
+done:floe_baseline_v2benchf0_s44 | bash tools/system/eval_bench.sh test 0 44 {GPU}
+done:floe_baseline_v2benchf1_s44 | bash tools/system/eval_bench.sh test 1 44 {GPU}
+done:floe_baseline_v2benchf2_s44 | bash tools/system/eval_bench.sh test 2 44 {GPU}
+done:floe_baseline_v2benchf3_s44 | bash tools/system/eval_bench.sh test 3 44 {GPU}
+done:floe_baseline_v2benchf4_s44 | bash tools/system/eval_bench.sh test 4 44 {GPU}
+# Row "AutoICE train -> 2026": NOT READY, see paper_dataset/NUMBERS.md (Table 7). The existing AutoICE model
+# (work_dir/floe_a4a_baseline_s42, configs/AI4Arctic/a4a_baseline.py, 74.1 % on the AutoICE test scenes) was
+# trained on AutoICE scenes mapped to the z-scores of the original archive (tools.data.convert_ai4arctic,
+# default --stats floe, with a [-35, 5] dB clip), whereas the 2026 scenes are in AutoICE z-scores. Scoring it
+# on 2026 needs either the same mapping applied to the 2026 inputs (a config with an input mapping, not in
+# the code yet) or a model trained on ai4arctic/floe_format_v2 (configs/AI4Arctic/a4a_v2.py, a new GPU run).
+# Once the authors have chosen and a config/checkpoint exist, the entry is of this form (baseline_table.py
+# reads --rev NAME):
+# always | bash tools/system/eval_bench.sh model a4a_v0map_s42 configs/AI4Arctic/<eval config on 2026> /root/autodl-tmp/WannianLi/FLOE/work_dir/floe_a4a_baseline_s42/best_model_floe_a4a_baseline_s42.pth {GPU}
