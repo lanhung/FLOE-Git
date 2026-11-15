@@ -1,0 +1,19 @@
+# Paper 2 benchmark arm if the screening rule (tools/analysis/screen_rule.py, DECISIONS.md item 10)
+# selects the combined model: configs/V2/multitask_comp.py on the five folds of datalists/v2_bench,
+# seeds 42, 43, 44, fixed before any run; every run is reported. Written before the screening
+# scores were read. Only one of this file and v2_bench_multitask.txt is run.
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 0 42 multitask_comp:{GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 1 42 multitask_comp:{GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 2 42 multitask_comp:{GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 3 42 multitask_comp:{GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 4 42 multitask_comp:{GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 0 43 multitask_comp:{GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 1 43 multitask_comp:{GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 2 43 multitask_comp:{GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 3 43 multitask_comp:{GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 4 43 multitask_comp:{GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 0 44 multitask_comp:{GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 1 44 multitask_comp:{GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 2 44 multitask_comp:{GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 3 44 multitask_comp:{GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 4 44 multitask_comp:{GPU}
