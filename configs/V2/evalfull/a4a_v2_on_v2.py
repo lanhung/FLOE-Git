@@ -8,6 +8,8 @@ _V2_DIR = os.path.join(os.environ.get('FLOE_V2_DIR', '/root/autodl-tmp/WannianLi
 _base_ = ['../../AI4Arctic/a4a_v2.py']
 
 train_options = {
+    # tools.evaluate builds its dataset in mode 'train', which reads path_to_train_data
+    'path_to_train_data': _V2_DIR,
     'path_to_test_data': _V2_DIR,
     'val_tile_gate': False,
     # on-demand reading stays on: with val_tile_gate False it reads every chunk
