@@ -157,7 +157,9 @@ def check_one(job):
             if x.dtype.kind == 'S':
                 x = np.array([s.decode() for s in x], dtype=object)
                 y = np.asarray(y, dtype=object)
-            if not np.array_equal(np.asarray(x), np.asarray(y)):
+            same = (np.array_equal(np.asarray(x), np.asarray(y), equal_nan=True) if np.asarray(x).dtype.kind == 'f'
+                    else np.array_equal(np.asarray(x), np.asarray(y)))
+            if not same:   # NaN (undefined compositions) must count as equal to NaN
                 return dst, f'MISMATCH in {name}'
         for k in a.attrs:
             if k not in SKIP_ATTRS and k not in b.ncattrs():
