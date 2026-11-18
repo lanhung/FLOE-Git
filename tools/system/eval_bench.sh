@@ -26,15 +26,21 @@ source tools/system/floe_env.sh >/dev/null
 MODE=$1; shift
 SPLIT=datalists/v2_bench
 TILE_INDEX=$FLOE_ROOT/index/v2_bench_tile_index.npz
-EVAL_CFG=configs/V2/baseline_evalfull.py
+# ARM selects the benchmark arm of the test/valpoly modes (default: the dataset paper's baseline).
+ARM=${ARM:-baseline}
+case $ARM in
+  baseline) EVAL_CFG=configs/V2/baseline_evalfull.py ;;
+  multitask_comp) EVAL_CFG=configs/V2/evalfull/multitask_comp.py ;;
+  *) echo "unknown ARM $ARM"; exit 2 ;;
+esac
 case $MODE in
   test|valpoly)
     [ $# -eq 3 ] || { echo "usage: $0 $MODE FOLD SEED GPU"; exit 2; }
     FOLD=$1; SEED=$2; GPU=$3
-    RUN=floe_baseline_v2benchf${FOLD}_s${SEED}
+    RUN=floe_${ARM}_v2benchf${FOLD}_s${SEED}
     CFG=$EVAL_CFG
     CKPT=$FLOE_ROOT/work_dir/$RUN/best_model_$RUN.pth
-    TAG=baseline_s${SEED}_f${FOLD}
+    TAG=${ARM}_s${SEED}_f${FOLD}
     if [ "$MODE" = test ]; then LIST=$SPLIT/test.json; SUB=v2bench_test; SUFFIX=test2026
     else LIST=$SPLIT/fold${FOLD}_val.json; SUB=v2bench_full; SUFFIX=valfull; fi
     NAME=$RUN ;;
@@ -63,9 +69,9 @@ for f in "$CM" "$POLY"; do
 done
 if [ "$SUFFIX" = test2026 ]; then
   for S in 42 43 44; do for K in 0 1 2 3 4; do
-    L=$FLOE_LOG_DIR/floe_baseline_v2benchf${K}_s${S}.log
+    L=$FLOE_LOG_DIR/floe_${ARM}_v2benchf${K}_s${S}.log
     if ! { grep -aq '^\[launch\] .* done$' "$L" && grep -aq '^EXIT_TRAIN=0$' "$L" && grep -aq '^EXIT_EVAL=0$' "$L"; } 2>/dev/null; then
-      echo "[eval_bench] $TAG: benchmark run f${K}_s${S} has not ended cleanly ($L); the 2026 scenes are not scored yet"
+      echo "[eval_bench] $TAG: $ARM run f${K}_s${S} has not ended cleanly ($L); the 2026 scenes are not scored yet"
       exit 3
     fi
   done; done
