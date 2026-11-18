@@ -1,0 +1,16 @@
+# Paper 2: the 15 multitask_comp benchmark runs, scored on the 486 scenes of 2026 after all 15 have ended; same protocol as the baseline (v2_bench_test.txt).
+done:floe_multitask_comp_v2benchf0_s42 | ARM=multitask_comp bash tools/system/eval_bench.sh test 0 42 {GPU}
+done:floe_multitask_comp_v2benchf1_s42 | ARM=multitask_comp bash tools/system/eval_bench.sh test 1 42 {GPU}
+done:floe_multitask_comp_v2benchf2_s42 | ARM=multitask_comp bash tools/system/eval_bench.sh test 2 42 {GPU}
+done:floe_multitask_comp_v2benchf3_s42 | ARM=multitask_comp bash tools/system/eval_bench.sh test 3 42 {GPU}
+done:floe_multitask_comp_v2benchf4_s42 | ARM=multitask_comp bash tools/system/eval_bench.sh test 4 42 {GPU}
+done:floe_multitask_comp_v2benchf0_s43 | ARM=multitask_comp bash tools/system/eval_bench.sh test 0 43 {GPU}
+done:floe_multitask_comp_v2benchf1_s43 | ARM=multitask_comp bash tools/system/eval_bench.sh test 1 43 {GPU}
+done:floe_multitask_comp_v2benchf2_s43 | ARM=multitask_comp bash tools/system/eval_bench.sh test 2 43 {GPU}
+done:floe_multitask_comp_v2benchf3_s43 | ARM=multitask_comp bash tools/system/eval_bench.sh test 3 43 {GPU}
+done:floe_multitask_comp_v2benchf4_s43 | ARM=multitask_comp bash tools/system/eval_bench.sh test 4 43 {GPU}
+done:floe_multitask_comp_v2benchf0_s44 | ARM=multitask_comp bash tools/system/eval_bench.sh test 0 44 {GPU}
+done:floe_multitask_comp_v2benchf1_s44 | ARM=multitask_comp bash tools/system/eval_bench.sh test 1 44 {GPU}
+done:floe_multitask_comp_v2benchf2_s44 | ARM=multitask_comp bash tools/system/eval_bench.sh test 2 44 {GPU}
+done:floe_multitask_comp_v2benchf3_s44 | ARM=multitask_comp bash tools/system/eval_bench.sh test 3 44 {GPU}
+done:floe_multitask_comp_v2benchf4_s44 | ARM=multitask_comp bash tools/system/eval_bench.sh test 4 44 {GPU}
