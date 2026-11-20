@@ -73,6 +73,9 @@ def parse_args():
     parser.add_argument('--composition-dir', type=pathlib.Path, default=None,
                         help='chart sidecars (<scene>.chart.h5, tools.build.make_scene): '
                              'also score predicted class fractions per ice-chart polygon')
+    parser.add_argument('--dump-preds', type=pathlib.Path, default=None,
+                        help='directory for per-scene class maps (<scene>.npz, uint8, one array per chart); '
+                             'for figures, use with a short --val-list')
     parser.add_argument('--dump-polygons', type=pathlib.Path, default=None,
                         help='with --composition-dir: save per-polygon predicted histograms and '
                              'chart compositions (.npz) for tools.analysis.composition_eval')
@@ -559,6 +562,12 @@ def main():
                         y_t = torch.nn.functional.interpolate(
                             y_t, size=original_size, mode='nearest').squeeze()
                         inf_y[chart] = y_t.cpu().numpy()
+
+            if args.dump_preds is not None:
+                mkdir_or_exist(str(args.dump_preds))
+                np.savez_compressed(osp.join(str(args.dump_preds), f'{scene_id}.npz'),
+                                    **{c: output_class[c].cpu().numpy().astype(np.uint8)
+                                       for c in train_options['charts']})
 
             scene_result = compute_scene_metrics(output_class, inf_y, cfv_masks, train_options)
             per_scene_results[scene_id] = scene_result
