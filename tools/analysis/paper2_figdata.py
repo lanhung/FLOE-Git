@@ -45,7 +45,8 @@ def score(cm):
 
 def comp_of(path):
     d = np.load(path, allow_pickle=True)
-    return float(confusion_scores(composition_confusion(d['hist'], d['q'], d['u'])['full'])['miou'])
+    c = composition_confusion(d['hist'], d['q'], d['u'])
+    return float(confusion_scores(c['full'])['miou']), float(confusion_scores(c['ice'])['miou'])
 
 
 def mixed_mask(h, q, u):
@@ -83,7 +84,7 @@ def main():
                     tot[name] = tot[name] + cm.sum(0)
                     sc = score(cm.sum(0))
                     sc.pop('iou')
-                    sc['comp'] = comp_of(os.path.join(C, 'poly', sub, f'{arm}_s{s}_f{k}.npz'))
+                    sc['comp'], sc['comp_ice'] = comp_of(os.path.join(C, 'poly', sub, f'{arm}_s{s}_f{k}.npz'))
                     row[name] = sc
                 names, cm = cm_of(os.path.join(C, 'a4a', f'v2bench_{arm}_s{s}_f{k}_test.npz'))
                 row['autoice'] = {}
@@ -101,7 +102,7 @@ def main():
     for name, sub in (('folds', 'v2bench_full'), ('2026', 'v2bench_test')):
         mixed[name] = {}
         for arm in arms:
-            pred, chart, npoly, npx = np.zeros(6), np.zeros(6), 0, 0.0
+            pred, chart, npoly, npx, tv = np.zeros(6), np.zeros(6), 0, 0.0, []
             for s in SEEDS:
                 for k in FOLDS:
                     d = np.load(os.path.join(C, 'poly', sub, f'{arm}_s{s}_f{k}.npz'), allow_pickle=True)
@@ -112,8 +113,13 @@ def main():
                     chart += (qn * h[m].sum(1, keepdims=True)).sum(0)
                     npoly += int(m.sum())
                     npx += float(h[m].sum())
+                    hi = h[m][:, 1:] / h[m][:, 1:].sum(1, keepdims=True).clip(1e-9)     # predicted mix of the ice
+                    qi = q[m][:, 1:] / q[m][:, 1:].sum(1, keepdims=True)                # chart mix of the ice
+                    w = h[m].sum(1)
+                    tv.append(float((0.5 * np.abs(hi - qi).sum(1) * w).sum() / w.sum()))
             mixed[name][arm] = {'pred': (pred / pred.sum()).tolist(), 'chart': (chart / chart.sum()).tolist(),
-                                'polygons_per_run': npoly / 15.0, 'mpx_per_run': npx / 15.0 / 1e6}
+                                'polygons_per_run': npoly / 15.0, 'mpx_per_run': npx / 15.0 / 1e6,
+                                'tv_ice_mix': float(np.mean(tv))}
     out['mixed'] = mixed
 
     # coverage of the charted ice area by each kind of supervision (whole dataset)
@@ -133,6 +139,8 @@ def main():
             'sod_label': float(px[ice & (sod != 255)].sum() / area),
             'composition': float(px[ice & usable & has_mix].sum() / area),
             'composition_without_floe_label': float(px[ice & usable & has_mix & ~((floe >= 1) & (floe <= 5))].sum() / area),
+            'sic_without_floe_label': float(px[ice & (sic != 255) & ~((floe >= 1) & (floe <= 5))].sum() / area),
+            'sod_without_floe_label': float(px[ice & (sod != 255) & ~((floe >= 1) & (floe <= 5))].sum() / area),
             'sic_values': sorted(int(v) for v in np.unique(sic)), 'sod_values': sorted(int(v) for v in np.unique(sod)),
         }
 

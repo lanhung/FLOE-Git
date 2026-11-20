@@ -82,9 +82,11 @@ def forest(cmp_, out):
             pu = np.array(d['per_unit'])
             jit = (np.linspace(-0.22, 0.22, len(pu)) if len(pu) > 3 else np.linspace(-0.12, 0.12, len(pu)))
             ax.scatter(pu, y + jit, s=7, color=BASE, alpha=0.75, lw=0, zorder=2)
+            pooled = cmp_[key]['pooled']['arm'][r[0]] - cmp_[key]['pooled']['base'][r[0]]
             ax.plot(d['boot95'], [y, y], color=ARM, lw=2.2, solid_capstyle='round', zorder=3)
             ax.plot(d['t95'], [y - 0.3, y - 0.3], color=INK2, lw=0.9, zorder=3)
-            ax.scatter([d['mean']], [y], s=30, color=ARM, edgecolor='white', lw=0.8, zorder=4)
+            ax.plot([d['mean']] * 2, [y - 0.38, y - 0.22], color=INK2, lw=0.9, zorder=3)
+            ax.scatter([pooled], [y], s=30, color=ARM, edgecolor='white', lw=0.8, zorder=4)
             ticks.append(y)
             labels.append(r[1])
             y -= 1.0
@@ -102,8 +104,9 @@ def forest(cmp_, out):
                  color=MUTED)
     units = 'seeds (left) or models (right)'
     fig.legend(handles=[Line2D([0], [0], marker='o', color=ARM, lw=2.2, markersize=5, markeredgecolor='white',
-                               label='Mean and 95 % interval over scene groups'),
-                        Line2D([0], [0], color=INK2, lw=0.9, label=f'95 % interval over {units}'),
+                               label='Pooled difference, 95 % interval over scene groups'),
+                        Line2D([0], [0], color=INK2, lw=0.9, marker='|', markersize=5,
+                               label=f'Mean and 95 % interval over {units}'),
                         Line2D([0], [0], marker='o', color=BASE, lw=0, markersize=3, label='Single pairs')],
                loc='lower center', ncol=3, bbox_to_anchor=(0.5, -0.17), columnspacing=1.6, handletextpad=0.5)
     save(fig, out, 'forest')
@@ -404,10 +407,10 @@ def schematic(fd, out):
     box(38.5, 28.5, 20, 9, 'Floe-size decoder\n6 classes', base_kw, 6.4)
     box(38.5, 15.5, 20, 9, 'Concentration decoder\ntenths', add_kw, 6.4)
     box(38.5, 2.5, 20, 9, 'Stage decoder\n6 classes', add_kw, 6.4)
-    box(63, 33.6, 37, 5.2, f"Cross-entropy, pixels with a floe-size label ({100 * cov['floe_label']:.0f} %)", base_kw, 5.9)
+    box(63, 33.6, 37, 5.2, f"Cross-entropy, labelled pixels ({100 * cov['floe_label']:.0f} %)", base_kw, 5.9)
     box(63, 26.4, 37, 5.2, f"Composition loss, chart polygons ({100 * cov['composition']:.0f} %)", add_kw, 5.9)
-    box(63, 17.4, 37, 5.2, f"0.5 \u00d7 cross-entropy, total concentration ({100 * cov['sic_label']:.0f} %)", add_kw, 5.9)
-    box(63, 4.4, 37, 5.2, f"0.5 \u00d7 cross-entropy, dominant stage ({100 * cov['sod_label']:.0f} %)", add_kw, 5.9)
+    box(63, 17.4, 37, 5.2, f"0.5 \u00d7 cross-entropy, concentration ({100 * cov['sic_label']:.0f} %)", add_kw, 5.9)
+    box(63, 4.4, 37, 5.2, f"0.5 \u00d7 cross-entropy, stage ({100 * cov['sod_label']:.0f} %)", add_kw, 5.9)
     arrow((17.5, 20), (22, 20))
     for y in (33, 20, 7):
         arrow((34, 20), (38.5, y))
