@@ -82,3 +82,21 @@ MIT，见 [LICENSE](LICENSE)。`floe/functions.py` 等文件源自滑铁卢大�
 ## 数据来源
 
 旧档案（417 景）由 `preprocessing/`（SNAP 流程）生成；其问题与替代方案见 `docs/DATA_PIPELINE_AUDIT.md`。新档案由 `tools/build` 生成。
+
+## FLOE v1.0: dataset, benchmark and papers
+
+This branch (`paper-revision`) holds the code behind the FLOE v1.0 dataset (3224 Sentinel-1 EW scenes with DMI
+ice-chart floe-size labels around Greenland, 2022-2026) and the two papers that use it.
+
+- **Code archive:** https://doi.org/10.5281/zenodo.24295581 (all versions; MIT licence).
+- **Dataset:** deposited in Science Data Bank under CC BY 4.0 (DOI on publication of the dataset paper). Ice charts:
+  The Greenland Ice Service, Danish Meteorological Institute. Contains modified Copernicus Sentinel data 2022-2026.
+- **Build and release:** `tools/build/` (pairing, labels from the egg codes, `split.py` for the benchmark split in
+  `datalists/v2_bench/`, `release.py` for the public netCDF files with checksums).
+- **Dataset paper:** `tools/analysis/archive_stats.py`, `leak_effect.py`, `baseline_table.py` (Table 7),
+  `tools/figures/data_paper.py`.
+- **Method paper:** `tools/analysis/screen_rule.py` (choice of the benchmark model), `paper2_compare.py` (the
+  comparison fixed before the results), `paper2_breakdown.py`, `paper2_figdata.py`, `paper2_tables.py`,
+  `tools/figures/method_paper.py`.
+- **Runs:** `configs/V2/` (baseline, multitask, comp_aux, multitask_comp), `tools/system/launch_fold.sh`,
+  `tools/system/eval_bench.sh`, run lists in `tools/system/queues/`.
