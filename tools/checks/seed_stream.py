@@ -23,7 +23,7 @@ from floe.loaders import get_variable_options, limit_torch_threads
 from tools.train import build_seeded_model, create_dataloaders
 
 
-def stream_hashes(cfg_path, n_batches, workers, seed, legacy, device):
+def stream_hashes(cfg_path, n_batches, workers, seed, legacy, device, charts=None):
     opts = get_variable_options(copy.deepcopy(Config.fromfile(cfg_path).train_options))
     opts['_resolved_seed'] = seed
     opts['num_workers'] = workers
@@ -37,7 +37,8 @@ def stream_hashes(cfg_path, n_batches, workers, seed, legacy, device):
         h = hashlib.sha256()
         h.update(bx.contiguous().numpy().tobytes())
         for c in sorted(by):
-            h.update(by[c].contiguous().numpy().tobytes())
+            if charts is None or c in charts:   # --charts: compare only targets all configs share
+                h.update(by[c].contiguous().numpy().tobytes())
         out.append(h.hexdigest()[:16])
         if i + 1 >= n_batches:
             break
@@ -48,6 +49,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('configs', nargs='+')
     ap.add_argument('--batches', type=int, default=3)
+    ap.add_argument('--charts', nargs='*', default=None,
+                    help='hash only these label charts besides the inputs (e.g. FLOE when the configs differ in '
+                         'auxiliary targets such as SIC/SOD or composition bags)')
     ap.add_argument('--workers', type=int, default=2)
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--legacy', action='store_true')
@@ -59,7 +63,7 @@ def main():
     res = {}
     for c in args.configs:
         res[c] = stream_hashes(c, args.batches, args.workers, args.seed,
-                               args.legacy, device)
+                               args.legacy, device, charts=args.charts)
         print(f'{c}: {" ".join(res[c])}', flush=True)
     ref = res[args.configs[0]]
     same = all(v == ref for v in res.values())
