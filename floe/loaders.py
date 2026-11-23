@@ -386,8 +386,9 @@ def val_ondemand_ok(options, n_models=1):
     """
     if not options.get('val_ondemand_read', True):
         return False, 'config 的 val_ondemand_read=False（全局关闭）'
-    if n_models != 1:
+    if n_models != 1 and options.get('val_tile_gate', True):
         return False, f'集成推理（{n_models} 个模型），need 网格只按第一个模型的 patch_size 算'
+    # without the tile gate every chunk is read (prep_scene_ondemand), so an ensemble is safe
     if options.get('down_sample_scale', 1) != 1 or options.get('val_downsample_scale', 1) != 1:
         return False, '降采样口径下整景 interpolate 需要全部像素'
     if 'global_valid_mask' not in list(options.get('train_variables', [])):

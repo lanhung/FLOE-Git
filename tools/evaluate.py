@@ -494,7 +494,7 @@ def main():
 
         # tile 门控：标签全为 ignore 的 tile 不前向；任一 chart 有有效像元就要算。
         tile_gate = None
-        if cfv_masks is not None:
+        if cfv_masks is not None and train_options.get('val_tile_gate', True):
             for chart in train_options['charts']:
                 m = compute_valid_tile_mask(~cfv_masks[chart], train_options['patch_size'])
                 tile_gate = m if tile_gate is None else (tile_gate | m)

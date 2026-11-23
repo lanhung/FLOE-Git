@@ -1,0 +1,21 @@
+# Paper 2, DECISIONS.md item 14 (23 Nov 2026, before any run of the new arm): ensembles of the two finished
+# arms (item 14b), then the ablation arm `multitask` (auxiliary decoders only) on the benchmark, seeds 42-44.
+always | ARM=baseline bash tools/system/eval_bench.sh ensemble test2026 {GPU}
+always | ARM=multitask_comp bash tools/system/eval_bench.sh ensemble test2026 {GPU}
+always | ARM=baseline bash tools/system/eval_bench.sh ensemble autoice {GPU}
+always | ARM=multitask_comp bash tools/system/eval_bench.sh ensemble autoice {GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 0 42 multitask:{GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 1 42 multitask:{GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 2 42 multitask:{GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 3 42 multitask:{GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 4 42 multitask:{GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 0 43 multitask:{GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 1 43 multitask:{GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 2 43 multitask:{GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 3 43 multitask:{GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 4 43 multitask:{GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 0 44 multitask:{GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 1 44 multitask:{GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 2 44 multitask:{GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 3 44 multitask:{GPU}
+always | FLOE_ARCHIVE=v2 FLOE_V2_SPLIT=datalists/v2_bench FLOE_V2_NAME=v2bench FLOE_V2_TILE_INDEX=/root/autodl-tmp/WannianLi/FLOE/index/v2_bench_tile_index.npz bash tools/system/launch_fold.sh 4 44 multitask:{GPU}

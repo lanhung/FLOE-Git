@@ -20,6 +20,11 @@ the 95 % group-bootstrap interval of the composition difference lies above zero,
 difference is not below -0.005. Everything is reported whatever the outcome.
 
     python tools/analysis/paper2_compare.py --arm multitask_comp --json paper2_compare.json
+    python tools/analysis/paper2_compare.py --arm multitask --json paper2_compare_multitask.json
+    python tools/analysis/paper2_compare.py --arm multitask_comp --base multitask --json paper2_compare_comp_vs_mt.json
+
+--base (default baseline) is the reference arm; the second and third lines are the ablation of
+DECISIONS.md item 14, fixed before any run of the multitask arm on the benchmark.
 """
 import argparse
 import glob
@@ -162,6 +167,7 @@ def evaluate_set(name, files, group_of, n_boot, rng):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--arm', default='multitask_comp')
+    ap.add_argument('--base', default='baseline', help='reference arm')
     ap.add_argument('--cm-dir', default=os.environ.get('FLOE_CM_DIR'))
     ap.add_argument('--log', default=os.path.join(os.environ.get('FLOE_V2_DIR', ''), 'archive_log.jsonl'))
     ap.add_argument('--data-dir', default=os.environ.get('FLOE_V2_DIR'))
@@ -175,11 +181,11 @@ def main():
         return os.path.join(C, 'poly' if poly else '', sub, f'{arm}_s{s}_f{k}.npz').replace('//', '/')
 
     all_scenes = load_scenes(args.log, args.data_dir)
-    out = {'arm': args.arm}
+    out = {'arm': args.arm, 'base': args.base}
 
     # held-out folds: unit = seed (five folds pooled)
     fold_files = {s: ([p('v2bench_full', args.arm, s, k) for k in FOLDS], [p('v2bench_full', args.arm, s, k, True) for k in FOLDS],
-                      [p('v2bench_full', 'baseline', s, k) for k in FOLDS], [p('v2bench_full', 'baseline', s, k, True) for k in FOLDS])
+                      [p('v2bench_full', args.base, s, k) for k in FOLDS], [p('v2bench_full', args.base, s, k, True) for k in FOLDS])
                   for s in SEEDS}
     missing = [f for v in fold_files.values() for l in v for f in l if not os.path.exists(f)]
     if missing:
@@ -190,7 +196,7 @@ def main():
 
     if not args.skip_2026:
         test_files = {f'f{k}s{s}': ([p('v2bench_test', args.arm, s, k)], [p('v2bench_test', args.arm, s, k, True)],
-                                    [p('v2bench_test', 'baseline', s, k)], [p('v2bench_test', 'baseline', s, k, True)])
+                                    [p('v2bench_test', args.base, s, k)], [p('v2bench_test', args.base, s, k, True)])
                       for s in SEEDS for k in FOLDS}
         missing = [f for v in test_files.values() for l in v for f in l if not os.path.exists(f)]
         if missing:
@@ -204,7 +210,7 @@ def main():
     a4a = {}
     for svc in ('all', 'dmi', 'cis'):
         rows = {'base': [], 'arm': []}
-        for arm, key in ((args.arm, 'arm'), ('baseline', 'base')):
+        for arm, key in ((args.arm, 'arm'), (args.base, 'base')):
             for s in SEEDS:
                 for k in FOLDS:
                     names, cm = load_cm(os.path.join(C, 'a4a', f'v2bench_{arm}_s{s}_f{k}_test.npz'))
@@ -227,7 +233,7 @@ def main():
         better = dc['mean'] > 0 and dc['boot95'][0] > 0 and dm['mean'] >= -MARGIN
         out[setname]['verdict_better'] = bool(better)
         print(f'\n{setname}: composition {dc["mean"]:+.4f} (bootstrap [{dc["boot95"][0]:+.4f}, {dc["boot95"][1]:+.4f}]), '
-              f'mIoU {dm["mean"]:+.4f} -> {"BETTER than the baseline" if better else "not shown to be better"} by the rule')
+              f'mIoU {dm["mean"]:+.4f} -> {"BETTER than " + args.base if better else "not shown to be better than " + args.base} by the rule')
     if args.json:
         json.dump(out, open(args.json, 'w'), indent=1)
         print('->', args.json)

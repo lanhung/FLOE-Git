@@ -5,6 +5,8 @@
 #   bash tools/system/eval_bench.sh test    FOLD SEED GPU      baseline f<K> s<seed> on the 2026 test scenes
 #   bash tools/system/eval_bench.sh valpoly FOLD SEED GPU      the same model on its validation fold again
 #   bash tools/system/eval_bench.sh model NAME CONFIG CHECKPOINT GPU   any model on the 2026 test scenes
+#   ARM=<arm> bash tools/system/eval_bench.sh ensemble SET GPU   logits of the arm's 15 benchmark models averaged,
+#        SET = test2026 (-> $FLOE_CM_DIR/v2bench_test/ens_<arm>.npz, poly alike) or autoice (-> a4a/v2bench_ens_<arm>_test.npz)
 #   bash tools/system/eval_bench.sh screen NAME CONFIG CHECKPOINT GPU  a 2023 fold-0 model on its validation
 #        scenes (paper 2 screening, paper_method/DECISIONS.md), -> $FLOE_CM_DIR/v2_full/<NAME>.npz
 #
@@ -31,6 +33,7 @@ ARM=${ARM:-baseline}
 case $ARM in
   baseline) EVAL_CFG=configs/V2/baseline_evalfull.py ;;
   multitask_comp) EVAL_CFG=configs/V2/evalfull/multitask_comp.py ;;
+  multitask) EVAL_CFG=configs/V2/evalfull/multitask.py ;;
   *) echo "unknown ARM $ARM"; exit 2 ;;
 esac
 case $MODE in
@@ -48,6 +51,24 @@ case $MODE in
     [ $# -eq 4 ] || { echo "usage: $0 model NAME CONFIG CHECKPOINT GPU"; exit 2; }
     TAG=$1; CFG=$2; CKPT=$3; GPU=$4
     LIST=$SPLIT/test.json; SUB=v2bench_test; SUFFIX=test2026; NAME=floe_$TAG ;;
+  ensemble)
+    [ $# -eq 2 ] || { echo "usage: ARM=<arm> $0 ensemble test2026|autoice GPU"; exit 2; }
+    SET=$1; GPU=$2
+    case "$SET:$ARM" in
+      test2026:*) ECFG=$EVAL_CFG ;;
+      autoice:baseline) ECFG=configs/V2/evalfull/a4a_v2_gatefree.py ;;
+      autoice:*) ECFG=configs/V2/evalfull/a4a_v2_multitask_gatefree.py ;;
+    esac
+    CFGS=""; CKPTS=""
+    for S in 42 43 44; do for K in 0 1 2 3 4; do
+      R=floe_${ARM}_v2benchf${K}_s${S}
+      CFGS="$CFGS $ECFG"; CKPTS="$CKPTS $FLOE_ROOT/work_dir/$R/best_model_$R.pth"
+      [ -f "$FLOE_ROOT/work_dir/$R/best_model_$R.pth" ] || { echo "[eval_bench] ensemble $ARM: no checkpoint of $R"; exit 3; }
+    done; done
+    CFG=$ECFG; CKPT=$FLOE_ROOT/work_dir/floe_${ARM}_v2benchf0_s42/best_model_floe_${ARM}_v2benchf0_s42.pth
+    TAG=ens_${ARM}; NAME=floe_ens_${ARM}
+    if [ "$SET" = test2026 ]; then LIST=$SPLIT/test.json; SUB=v2bench_test; SUFFIX=ens2026
+    else LIST=datalists/ai4arctic/test.json; SUB=a4a; SUFFIX=ensa4a; TAG=v2bench_ens_${ARM}_test; fi ;;
   screen)
     [ $# -eq 4 ] || { echo "usage: $0 screen NAME CONFIG CHECKPOINT GPU"; exit 2; }
     TAG=$1; CFG=$2; CKPT=$3; GPU=$4
@@ -67,7 +88,7 @@ SESSION=floe-evb-${TAG}-${SUFFIX}
 for f in "$CM" "$POLY"; do
   if [ -e "$f" ]; then echo "[eval_bench] $TAG: $f exists, skipping (no overwrite)"; exit 0; fi
 done
-if [ "$SUFFIX" = test2026 ]; then
+if [ "$SUFFIX" = test2026 ] || [ "$SUFFIX" = ens2026 ] || [ "$SUFFIX" = ensa4a ]; then
   for S in 42 43 44; do for K in 0 1 2 3 4; do
     L=$FLOE_LOG_DIR/floe_${ARM}_v2benchf${K}_s${S}.log
     if ! { grep -aq '^\[launch\] .* done$' "$L" && grep -aq '^EXIT_TRAIN=0$' "$L" && grep -aq '^EXIT_EVAL=0$' "$L"; } 2>/dev/null; then
@@ -95,8 +116,8 @@ tmux new-session -d -s "$SESSION" "
     echo \"[launch] \$(date -Is) $NAME $MODE on GPU $GPU, config $CFG, list $LIST\"
     if [ -e $CM ] || [ -e $POLY ]; then echo 'output appeared in the meantime, not overwritten'; echo EXIT_EVAL=9
     else
-      python -m tools.evaluate --config $CFG --checkpoint $CKPT --val-list $LIST \
-          --dump-cm $CM --composition-dir $FLOE_V2_CHART_DIR --dump-polygons $POLY --output-dir $OUT
+      python -m tools.evaluate --config ${CFGS:-$CFG} --checkpoint ${CKPTS:-$CKPT} --val-list $LIST \
+          --dump-cm $CM $([ "${SUFFIX:-}" = ensa4a ] || echo "--composition-dir $FLOE_V2_CHART_DIR --dump-polygons $POLY") --output-dir $OUT
       echo \"EXIT_EVAL=\$?\"
     fi
     echo \"[launch] \$(date -Is) done\"
