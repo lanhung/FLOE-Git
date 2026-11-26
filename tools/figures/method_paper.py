@@ -5,7 +5,7 @@
     python -m tools.figures.method_paper example --figdata paper2_figdata.json --data-dir $FLOE_V2_DIR \
                                                --preds DIR        # DIR/<arm>/<scene>.npz from tools.evaluate --dump-preds
 
-`stats` writes classes, forest, regions, mixed, confusion and curves; `example` writes the scene
+`stats` writes classes, forest, regions, mixed, confusion and curves (and the ablation figure with --ablation); `example` writes the scene
 panels; `studyarea` (build environment: geopandas, rasterio) the map of the benchmark scenes. Inputs come from tools/analysis/paper2_figdata.py, paper2_compare.py and paper2_breakdown.py.
 
 Colours follow the dataset paper (tools.figures.data_paper): floe size is an ordered scale in one
@@ -110,6 +110,56 @@ def forest(cmp_, out):
                         Line2D([0], [0], marker='o', color=BASE, lw=0, markersize=3, label='Single pairs')],
                loc='lower center', ncol=3, bbox_to_anchor=(0.5, -0.17), columnspacing=1.6, handletextpad=0.5)
     save(fig, out, 'forest')
+
+
+# ------------------------------------------------------------------ ablation (DECISIONS.md item 14)
+
+ABLATION = (('Decoders only \u2212 baseline', 'mt_vs_base'), ('Combined \u2212 baseline', 'comp_vs_base'),
+            ('Combined \u2212 decoders only', 'comp_vs_mt'))
+
+
+def ablation(cmps, out):
+    """Small multiples: one panel per measure (own x scale), one row per test set, three paired comparisons per
+    panel. The rows are named on the axis, so the marks need no colour key."""
+    measures = (('comp', 'Composition'), ('miou', 'Mean IoU'), ('miou_ice', 'IoU, ice'),
+                ('hard', 'IoU, small+medium'), ('wf1', 'Weighted F1 (points)'))
+    fig, axes = plt.subplots(2, len(measures), figsize=(7.0, 2.9), sharey=True,
+                             gridspec_kw={'wspace': 0.24, 'hspace': 0.55})
+    ys = np.arange(len(ABLATION))[::-1].astype(float)
+    for r, (key, title) in enumerate(SETS):
+        for c, (m, mname) in enumerate(measures):
+            ax = axes[r, c]
+            scale = 100.0 if m == 'wf1' else 1.0
+            lo = hi = 0.0
+            for y, (_, ck) in zip(ys, ABLATION):
+                cm = cmps[ck][key]
+                d = cm['diff'][m]
+                pooled = (cm['pooled']['arm'][m] - cm['pooled']['base'][m]) * scale
+                b, t = np.array(d['boot95']) * scale, np.array(d['t95']) * scale
+                ax.plot(b, [y, y], color=ARM, lw=2.2, solid_capstyle='round', zorder=3)
+                ax.plot(t, [y - 0.28, y - 0.28], color=INK2, lw=0.9, zorder=3)
+                ax.plot([d['mean'] * scale] * 2, [y - 0.36, y - 0.20], color=INK2, lw=0.9, zorder=3)
+                ax.scatter([pooled], [y], s=24, color=ARM, edgecolor='white', lw=0.8, zorder=4)
+                lo, hi = min(lo, b[0], t[0]), max(hi, b[1], t[1])
+            pad = 0.12 * (hi - lo)
+            ax.set_xlim(lo - pad, hi + pad)
+            ax.axvline(0, color=INK, lw=0.7, zorder=1)
+            ax.grid(axis='x', color=GRID, lw=0.5, zorder=0)
+            ax.tick_params(axis='y', length=0)
+            ax.tick_params(axis='x', labelsize=6)
+            ax.locator_params(axis='x', nbins=2)
+            ax.set_title(mname if r == 0 else '', loc='left', fontsize=7)
+            ax.set_ylim(ys[-1] - 0.7, ys[0] + 0.5)
+        axes[r, 0].set_yticks(ys)
+        axes[r, 0].set_yticklabels([a[0] for a in ABLATION])
+        axes[r, 0].text(0.0, 1.32 if r == 0 else 1.12, title, transform=axes[r, 0].transAxes, fontsize=7.5,
+                        color=INK, fontweight='bold', ha='left')
+    fig.legend(handles=[Line2D([0], [0], marker='o', color=ARM, lw=2.2, markersize=5, markeredgecolor='white',
+                               label='Pooled difference, 95 % interval over scene groups'),
+                        Line2D([0], [0], color=INK2, lw=0.9, marker='|', markersize=5,
+                               label='Mean and 95 % interval over seeds (folds) or models (2026)')],
+               loc='lower center', ncol=2, bbox_to_anchor=(0.5, -0.06), columnspacing=1.6, handletextpad=0.5)
+    save(fig, out, 'ablation')
 
 
 # ------------------------------------------------------------------ hard-ice IoU by region and season
@@ -522,6 +572,8 @@ def main():
     p.add_argument('--figdata', required=True)
     p.add_argument('--compare', required=True)
     p.add_argument('--breakdown', required=True)
+    p.add_argument('--ablation', nargs=3, default=None, metavar=('MT_VS_BASE', 'COMP_VS_BASE', 'COMP_VS_MT'),
+                   help='paper2_compare.py JSONs of the ablation (DECISIONS.md item 14)')
     p = sub.add_parser('example')
     p.add_argument('--figdata', required=True)
     p.add_argument('--data-dir', required=True)
@@ -557,6 +609,8 @@ def main():
     confusion(fd, args.out)
     curves(fd, args.out)
     schematic(fd, args.out)
+    if args.ablation:
+        ablation({k: json.load(open(f)) for (_, k), f in zip(ABLATION, args.ablation)}, args.out)
 
 
 if __name__ == '__main__':

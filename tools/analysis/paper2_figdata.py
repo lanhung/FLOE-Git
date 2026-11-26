@@ -13,7 +13,10 @@ table). Nothing here changes a result; the comparison itself is tools/analysis/p
   examples       2026 scenes with the largest labelled area of small and medium floes on the
                  east and on the west coast (chosen by content, before looking at predictions)
 
-    python tools/analysis/paper2_figdata.py --arm multitask_comp --json paper2_figdata.json
+    python tools/analysis/paper2_figdata.py --arm multitask_comp --extra-arms multitask --json paper2_figdata.json
+
+`arms` in the JSON is baseline, --arm, then --extra-arms (the ablation arm of DECISIONS.md item 14);
+the figures of the primary comparison use the first two.
 """
 import argparse
 import json
@@ -57,13 +60,14 @@ def mixed_mask(h, q, u):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--arm', default='multitask_comp')
+    ap.add_argument('--extra-arms', nargs='*', default=[], help='further arms, e.g. the ablation arm multitask')
     ap.add_argument('--root', default=os.environ.get('FLOE_ROOT'))
     ap.add_argument('--table', default=None, help='polygon table of the whole dataset')
     ap.add_argument('--json', required=True)
     args = ap.parse_args()
     R = args.root
     C, L = os.path.join(R, 'cm'), os.path.join(R, 'logs')
-    arms = ('baseline', args.arm)
+    arms = ('baseline', args.arm, *args.extra_arms)
     out = {'arms': list(arms)}
 
     # confusion matrices and runs
