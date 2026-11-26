@@ -36,8 +36,14 @@ export WANDB_MODE=${WANDB_MODE:-offline}
 export WANDB_DIR=${WANDB_DIR:-$FLOE_ROOT}
 FLOE_ENV=${FLOE_ENV:-$FLOE_ROOT/envs/ice-binary}
 if [ -f /root/miniconda3/etc/profile.d/conda.sh ]; then
+    # conda's activate/deactivate hooks of other packages on this shared server read unset
+    # variables (e.g. deactivate-lalsimulation.sh); callers that use `set -u` would abort
+    # here (24 Nov 2026: every queue died at start). Switch nounset off for conda only.
+    case $- in *u*) _floe_nounset=1; set +u ;; *) _floe_nounset=0 ;; esac
     source /root/miniconda3/etc/profile.d/conda.sh
     conda activate "$FLOE_ENV"
+    [ "$_floe_nounset" = 1 ] && set -u
+    unset _floe_nounset
 fi
 # Blosc/zstd HDF5 filters come from `import hdf5plugin` in the readers. Do not also
 # export HDF5_PLUGIN_PATH: registering the same filter twice makes dataset creation
