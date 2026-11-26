@@ -100,3 +100,34 @@ ice-chart floe-size labels around Greenland, 2022-2026) and the two papers that 
   `tools/figures/method_paper.py`.
 - **Runs:** `configs/V2/` (baseline, multitask, comp_aux, multitask_comp), `tools/system/launch_fold.sh`,
   `tools/system/eval_bench.sh`, run lists in `tools/system/queues/`.
+
+### Rebuilding the dataset
+
+These commands rebuild FLOE v1.0 from the DMI chart archive and the Alaska Satellite Facility (an Earthdata
+account is needed for the downloads), as described in Sect. 4 and Appendix C of the dataset paper. Every step can
+be restarted where it stopped. Each product (about 0.26 GB) is read without unpacking and deleted after its scene
+is written, so little scratch space is needed; with 8 processes the build handled about 130 frames per hour.
+
+```bash
+# DMI charts of 2022-2026 and their index
+python -m tools.build.charts fetch --years 2022 2023 2024 2025 2026 --out raw/dmi
+python -m tools.build.charts index --dir raw/dmi
+# Sentinel-1 EW frames for every chart, one file per year
+for y in 2022 2023 2024 2025 2026; do
+  python -m tools.build.pair --charts raw/dmi --years $y --out raw/pairs_$y.json
+done
+# download, calibrate, label and write the scenes
+python -m tools.build.run_archive --pairs raw/pairs_*.json --charts raw/dmi \
+    --out data --chart-out charts --tmp raw/s1 --workers 8
+# benchmark split: grouped folds, held-out year 2026 with a 14-day buffer, charts within 5 min of the image
+python -m tools.build.split --log data/archive_log.jsonl --data-dir data --out datalists/v2_bench \
+    --folds 5 --max-gap-minutes 5 --test-year 2026 --buffer-days 14
+# polygon table, label ceiling and chart agreement (Sect. 6 of the dataset paper)
+python -m tools.build.polygon_table --data-dir data --out polygons
+python -m tools.build.label_purity --table polygons.npz --out purity
+python -m tools.build.chart_agreement --charts raw/dmi --out agreement
+python -m tools.analysis.agreement_bootstrap --prefix agreement
+# public netCDF files with checksums, scene table and split lists
+python -m tools.build.release --data-dir data --table polygons.npz --log data/archive_log.jsonl \
+    --split datalists/v2_bench --out release_v1
+```

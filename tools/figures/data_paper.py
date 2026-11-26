@@ -43,7 +43,7 @@ KM2 = 0.08 ** 2                                         # one 80 m pixel
 
 plt.rcParams.update({
     'font.size': 7.5, 'axes.titlesize': 8, 'axes.labelsize': 7.5, 'xtick.labelsize': 7, 'ytick.labelsize': 7,
-    'legend.fontsize': 7, 'figure.dpi': 200, 'savefig.bbox': 'tight', 'savefig.pad_inches': 0.02,
+    'legend.fontsize': 7, 'figure.dpi': 200, 'savefig.dpi': 600, 'savefig.bbox': 'tight', 'savefig.pad_inches': 0.02,
     'pdf.fonttype': 42, 'ps.fonttype': 42, 'axes.edgecolor': AXIS, 'axes.linewidth': 0.6,
     'xtick.color': MUTED, 'ytick.color': MUTED, 'xtick.labelcolor': INK2, 'ytick.labelcolor': INK2,
     'axes.labelcolor': INK2, 'text.color': INK, 'axes.spines.top': False, 'axes.spines.right': False,
@@ -99,7 +99,7 @@ def coverage(args):
         ring = [(lon[i, j], lat[i, j]) for i, j in ((0, 0), (0, -1), (-1, -1), (-1, 0))]
         feet.append(Polygon(zip(*to_xy(*zip(*ring)))))
     bounds = np.array([p.bounds for p in feet])
-    res = 10e3
+    res = args.res_km * 1e3
     x0, y0 = np.floor(bounds[:, :2].min(0) / 1e5) * 1e5 - 1e5
     x1, y1 = np.ceil(bounds[:, 2:].max(0) / 1e5) * 1e5 + 1e5
     shape = (int((y1 - y0) / res), int((x1 - x0) / res))
@@ -355,6 +355,7 @@ def main():
     p.add_argument('--data-dir', required=True)
     p.add_argument('--charts', required=True, help='DMI chart root with index.json')
     p.add_argument('--land', default=None, help='Natural Earth land polygons (zip or shp)')
+    p.add_argument('--res-km', type=float, default=2.5, help='cell size of the footprint count map')
     p = sub.add_parser('season')
     p.add_argument('--table', required=True)
     p = sub.add_parser('example')
